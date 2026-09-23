@@ -1,29 +1,32 @@
-# fullFold
+# fullFold: unlocking the full speed of AF3!
 
-Wrapper-only multi-GPU scheduler for AlphaFold 3. It does not modify any
-AlphaFold 3 source. Inputs must already be featurisation-ready (MSA / template
-fields set, including `""` for MSA-free). This package does not run the
-AlphaFold 3 data pipeline.
+**fullFold** is a lightweight inference and scheduling layer for running AlphaFold 3 efficiently, with a particular focus on high-throughput workloads on one or more GPUs. It can boost throughput by up to **3-fold** by (1) moving CPU-side work to background processes to keep GPU utilization near full, and (2) intelligently select and allocate bucket sizes while balancing compilation overhead against inference throughput, and as a bonus it will enable compilation caching by default. The more jobs you run, the greater the impact of fullFold. However, even for a single or a few jobs, fullFold is faster than native AlphaFold 3 in approximately 95% of cases, while in the remaining cases it performs on par with native AF3.
+
+On multi-GPU systems, fullFold orchestrates prediction jobs across all available GPUs, including heterogeneous systems with GPUs of different performance. It dynamically distributes workloads while reducing unnecessary scheduling overhead and fully preserving the underlying AF3 inference implementation. In our benchmarks, fullFold has shown near-linear scaling with both the number and performance of available GPUs**, allowing throughput to scale efficiently across multi-GPU systems.
+
+fullFold is deliberately non-invasive: it does not modify the AlphaFold 3 source code or model, making it straightforward to use alongside an existing AlphaFold 3 installation. It operates on fully prepared AlphaFold 3 inputs and focuses exclusively on the inference stage, not MSA generation or other parts of the data pipeline.
+
+Inputs must therefore already contain the required MSA and template fields, including `""` where appropriate for MSA-free predictions. **fullFold does not run or replace the AlphaFold 3 data pipeline**; feature generation using the standard AlphaFold 3 pipeline must be completed before running fullFold.
 
 See [docs/design.md](docs/design.md) for the cost model and [examples/demo.sh](examples/demo.sh)
-for a template → scan → dry-run → kill → resume walkthrough.
+for a template → scan → dry-run → kill → resume walkthrough (although just a run can be enough).
 
 ## Install
 
-Requires Python 3.12+ and `alphafold3>=3.0.2` in the same environment. The
-AlphaFold 3 git checkout is not needed as the working directory.
+Requires Python 3.12+ and `alphafold3>=3.0.2` in the same environment. 
 
 ```bash
+# when installing from this GitHub repo
 pip install .
-# or, once published:
+# or directly via pip:
 pip install fullFold
 ```
 
-Then run `fullFold` or `python -m fullFold` from any directory.
+Then run `fullFold` or `fullfold` (same command) or `python -m fullFold` from any directory.
 
 ## Quickstart
 
-With GPUs visible and model weights at `--model-dir`:
+With one ore more GPUs visible and model weights specified via `--model-dir`:
 
 ```bash
 fullFold run --input-dir jobs/ --output-dir results/ --model-dir /path/to/models
@@ -57,11 +60,11 @@ Resume is the same command: completed jobs (matching `done.json` hash) are skipp
 
 | Command | What it does |
 |---|---|
-| `scan` | Token-estimate every `*.json` in `--input-dir`, write `ledger.jsonl` |
-| `benchmark` | 1024-token 4-seed probe per GPU; cached under `~/.cache/fullFold/bench/` |
+| `run` | All-in-one command: will run scan the AF3 json, plan them, and then execute. `--dry-run` stops after plan |
+| `scan` | Verify and calculate the tokens for every `*.json` in `--input-dir` (writes `ledger.jsonl`) |
+| `benchmark` | benchmark of the available GPUs for a 1024-token 4-seed probe per GPU; cached under `~/.cache/fullFold/bench/` |
 | `plan` | Scan + benchmark (on cache miss) + write per-GPU manifests |
-| `run` | Plan then execute. `--dry-run` stops after manifests |
-| `template` | One output JSON per record in a FASTA / CSV / SMI file |
+| `template` | Quickly setting up batch screens, from a template JSON file combined with each record in a FASTA / CSV / SMI file (one output JSON per record) |
 
 ## GPU scheduling
 
@@ -130,3 +133,13 @@ Under `<output-dir>/_af3sched/`:
 SMILES are always ligands. Kind comes from the file extension (`.smi` / `.smiles`), a CSV `smiles` column, or `--type`. The same string `CCCC` is a ligand from `.smi` and a protein from FASTA. `--type ligand` on a FASTA is refused.
 
 Added proteins get `"unpairedMsa": ""`, `"pairedMsa": ""`, `"templates": []` (MSA-free). That is how a de novo or peptide screen skips the AlphaFold 3 data pipeline. Existing template chains are not touched. `modelSeeds` is copied verbatim and never synthesised.
+
+## Citing fullFold
+
+A preprint or publication describing **fullFold** is not yet available. In the meantime, if you use fullFold in your work, please cite this GitHub repository and the specific version used:
+
+> Verhellen, J. & Kooistra, A. J. **fullFold: Unlocking the Full Speed of AlphaFold 3.** Version `<version>`. GitHub: `https://github.com/DSDD-UCPH/fullFold`.
+
+For reproducibility, please replace `<version>` with the fullFold release used in your analysis (for example, `v0.1.0`). If you used an unreleased version, please cite the corresponding Git commit hash in addition to the repository URL.
+
+Once a preprint or publication becomes available, the recommended citation will be updated here.

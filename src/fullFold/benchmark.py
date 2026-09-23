@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -216,8 +217,15 @@ def get_or_measure(
         else:
             out.append((g, b))
     if missing:
+        n = len(missing)
+        gpu_word = 'GPU' if n == 1 else 'GPUs'
+        print(
+            f'A few-minute benchmark of the available GPUs is running '
+            f'({n} {gpu_word}).',
+            file=sys.stderr,
+        )
         from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=len(missing)) as ex:
+        with ThreadPoolExecutor(max_workers=n) as ex:
             benches = list(ex.map(lambda g: measure_fn(g, cfg), missing))
         out.extend(zip(missing, benches))
         out.sort(key=lambda x: x[0].slot)

@@ -5,12 +5,14 @@ from __future__ import annotations
 import sys
 
 BANNER = """\
-  __       _  _ _____     _     _
- / _|_  _ | || |  ___|___| | __| |
-| |_| || || || |_|   \\___/|_|\\__,_|
+  __       _ _ _____     _     _ 
+ / _|_   _| | |  ___|__ | | __| |
+| |_| | | | | | |_ / _ \\| |/ _` |
+|  _| |_| | | |  _| (_) | | (_| |
+|_|  \\__,_|_|_|_|  \\___/|_|\\__,_|
 
-AlphaFold 3 at full throughput!
-Please cite AlphaFold3 and the upcoming fullFold paper (updates in our repo).
+fullFold: unlocking the full speed of AF3!
+Please cite AlphaFold3 and fullFold (see our repository).
 """
 
 

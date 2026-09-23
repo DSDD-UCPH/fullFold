@@ -105,12 +105,23 @@ def test_load_bench_ignores_stale_contaminated_flag(tmp_path: Path):
     assert b.r_ms == pytest.approx(r)
 
 
-def test_cache_miss_measures(tmp_path: Path):
+def test_cache_miss_measures(tmp_path: Path, capsys):
     cfg = Config(cache_dir=tmp_path)
     gpu = Gpu(0, '0', 'u', 'pci', 'A100', 0)
     b = Bench((10, 10, 10, 10), 10, 0, True, 'h', 'k')
     out = get_or_measure([gpu], cfg, measure_fn=lambda g, c: b)
     assert out[0][1].contaminated
+    err = capsys.readouterr().err
+    assert 'A few-minute benchmark of the available GPUs is running (1 GPU).' in err
+
+
+def test_cache_hit_skips_benchmark_notice(tmp_path: Path, capsys):
+    cfg = Config(cache_dir=tmp_path)
+    gpu = Gpu(0, '0', 'u', 'pci', 'A100', 0)
+    b = Bench((1000, 200, 180, 220), 200, 400, False, 'h', 'k')
+    save_bench(cache_path(cfg, gpu), b)
+    get_or_measure([gpu], cfg, measure_fn=lambda g, c: b)
+    assert 'benchmark of the available GPUs' not in capsys.readouterr().err
 
 
 def test_to_scheduler_gpu_uses_probe_s():

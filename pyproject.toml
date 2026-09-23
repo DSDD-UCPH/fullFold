@@ -23,6 +23,7 @@ keywords = ["alphafold", "alphafold3", "gpu", "scheduler"]
 
 [project.scripts]
 fullFold = "fullFold.cli:main"
+fullfold = "fullFold.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest", "build"]
