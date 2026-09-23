@@ -22,15 +22,17 @@ pip install .
 pip install fullFold
 ```
 
-Then run `fullFold` or `fullfold` (same command) or `python -m fullFold` from any directory.
+Then run `fullFold` or `python -m fullFold` from any directory.
 
 ## Quickstart
 
-With one ore more GPUs visible and model weights specified via `--model-dir`:
+The main command that does everything (it will run a few minute benchmark the first time):
 
 ```bash
 fullFold run --input-dir jobs/ --output-dir results/ --model-dir /path/to/models
 ```
+
+## Other commands
 
 Dry-run the same plan without launching workers:
 
@@ -45,10 +47,20 @@ fullFold template --template receptor.json --records ligands.smi --output-dir jo
 fullFold run --input-dir jobs/ --output-dir results/ --model-dir /path/to/models
 ```
 
-Generate an MSA-free peptide / de novo protein screen (empty MSAs and
-templates are written for each added chain; existing receptor chains are
-left untouched):
+## Helper commands - setting up batches
 
+For setting up small-molecule screens or MSA-free peptide / de novo protein screens, you can use the template command below. For peptides and proteins it will write empty MSAs and
+skip templates. 
+
+It takes an existing json input template with your configuration of interest, but without the other peptide/protein/small molecule. In our cases, this was often a single protein entry with all MSAs prepped. The records in the SMI/CSV/FASTA file are added as a new chain; existing receptor chains are left untouched):
+
+Example 1 (SMILES input):
+```bash
+fullFold template --template receptor.json --records ligands.smi --output-dir jobs/
+fullFold run --input-dir jobs/ --output-dir results/ --model-dir /path/to/models
+```
+
+Example 2 (fasta input):
 ```bash
 fullFold template --template receptor.json --records binders.fasta --type protein --output-dir jobs/
 fullFold run --input-dir jobs/ --output-dir results/ --model-dir /path/to/models
