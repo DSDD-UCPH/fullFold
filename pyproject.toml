@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fullFold"
+version = "0.1.0"
+description = "AlphaFold 3 at full throughput"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = ["alphafold3>=3.0.2"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+keywords = ["alphafold", "alphafold3", "gpu", "scheduler"]
+
+[project.scripts]
+fullFold = "fullFold.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest", "build"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["fullFold*"]
+
+[tool.setuptools.package-data]
+fullFold = ["data/*.csv"]
+
+[tool.pytest.ini_options]
+testpaths = ["src/tests"]
+pythonpath = ["src"]
