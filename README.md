@@ -18,18 +18,18 @@ Requires Python 3.12+ and `alphafold3>=3.0.2` in the same environment.
 ```bash
 # when installing from this GitHub repo
 pip install .
-# or directly via pip:
-pip install fullFold
+# or directly via pip (SOON, not yet available):
+pip install fullfold
 ```
 
-Then run `fullFold` or `python -m fullFold` from any directory.
+Then run `fullfold` / `fullFold` (same command) or `python -m fullFold` from any directory.
 
 ## Quickstart
 
 The main command that does everything (it will run a few minute benchmark the first time):
 
 ```bash
-fullFold run --input-dir jobs/ --output-dir results/ --model-dir /path/to/models
+fullfold run --input-dir jobs/ --output-dir results/ --model-dir /path/to/models
 ```
 
 ## Other commands
@@ -37,14 +37,14 @@ fullFold run --input-dir jobs/ --output-dir results/ --model-dir /path/to/models
 Dry-run the same plan without launching workers:
 
 ```bash
-fullFold run --input-dir jobs/ --output-dir results/ --model-dir /path/to/models --dry-run
+fullfold run --input-dir jobs/ --output-dir results/ --model-dir /path/to/models --dry-run
 ```
 
 Generate a ligand screen from a SMILES file, then schedule it:
 
 ```bash
-fullFold template --template receptor.json --records ligands.smi --output-dir jobs/
-fullFold run --input-dir jobs/ --output-dir results/ --model-dir /path/to/models
+fullfold template --template receptor.json --records ligands.smi --output-dir jobs/
+fullfold run --input-dir jobs/ --output-dir results/ --model-dir /path/to/models
 ```
 
 ## Helper commands - setting up batches
@@ -56,14 +56,14 @@ It takes an existing json input template with your configuration of interest, bu
 
 Example 1 (SMILES input):
 ```bash
-fullFold template --template receptor.json --records ligands.smi --output-dir jobs/
-fullFold run --input-dir jobs/ --output-dir results/ --model-dir /path/to/models
+fullfold template --template receptor.json --records ligands.smi --output-dir jobs/
+fullfold run --input-dir jobs/ --output-dir results/ --model-dir /path/to/models
 ```
 
 Example 2 (fasta input):
 ```bash
-fullFold template --template receptor.json --records binders.fasta --type protein --output-dir jobs/
-fullFold run --input-dir jobs/ --output-dir results/ --model-dir /path/to/models
+fullfold template --template receptor.json --records binders.fasta --type protein --output-dir jobs/
+fullfold run --input-dir jobs/ --output-dir results/ --model-dir /path/to/models
 ```
 
 Resume is the same command: completed jobs (matching `done.json` hash) are skipped.
