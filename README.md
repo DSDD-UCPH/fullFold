@@ -18,7 +18,7 @@ Requires Python 3.12+ and DeepMind’s `alphafold3>=3.0.2` already installed in 
 ```bash
 # when installing from this GitHub repo
 pip install .
-# or directly via pip (SOON, not yet available):
+# or directly via pip
 pip install fullfold
 ```
 
