@@ -18,7 +18,7 @@ from fullFold.config import (
 from fullFold.jobs import Job, scan
 from fullFold.scheduling import (
     Group, candidate_shapes, compilation_us, groups_cost_us, inference_us,
-    job_floor_us, plan_multi_gpu, plan_round_robin, share_tails,
+    job_floor_us, plan_multi_gpu, plan_round_robin, reference_for, share_tails,
 )
 
 
@@ -75,20 +75,22 @@ def make_plan(
     jobs = sorted(jobs, key=lambda j: (j.bucket, j.tokens, j.job_id, j.sha256))
     work = [(j.tokens, j.n_seeds, j.job_id) for j in jobs]
     gpus = [g for g, _ in gpu_benches]
-    shapes = candidate_shapes(work, cfg.buckets, cfg.bucket_mode)
+    ref = reference_for(cfg.reference)
+    shapes = candidate_shapes(work, cfg.buckets, cfg.bucket_mode, ref)
     contaminated = any(b.contaminated for _, b in gpu_benches)
     policy = 'roundrobin' if (contaminated or cfg.policy == 'roundrobin') else cfg.policy
     split_mode = 'exact' if len(work) <= cfg.exact_split_threshold else 'coarsened'
     sched_gpus = [to_scheduler_gpu(b) for _, b in gpu_benches]
     if policy == 'roundrobin':
-        groups = plan_round_robin(work, len(gpus), shapes)
-        loads = [groups_cost_us(gr, work, sg) for gr, sg in zip(groups, sched_gpus)]
+        groups = plan_round_robin(work, len(gpus), shapes, ref)
+        loads = [
+            groups_cost_us(gr, work, sg, ref) for gr, sg in zip(groups, sched_gpus)]
         makespan = max(loads) if loads else 0
-        floor, floor_id = job_floor_us(work, sched_gpus, shapes)
+        floor, floor_id = job_floor_us(work, sched_gpus, shapes, ref)
     else:
         makespan, floor, floor_id, groups = plan_multi_gpu(
-            work, sched_gpus, shapes, cfg.exact_split_threshold)
-    groups = share_tails(groups, work, shapes, sched_gpus)
+            work, sched_gpus, shapes, cfg.exact_split_threshold, ref)
+    groups = share_tails(groups, work, shapes, sched_gpus, ref)
     gpu_rows = []
     for (g, b), (cu, inf1024) in zip(gpu_benches, sched_gpus):
         gpu_rows.append({
@@ -99,7 +101,8 @@ def make_plan(
         })
     meta = {
         'config_hash': config_hash(cfg), 'n_jobs': len(jobs), 'policy': policy,
-        'bucket_mode': cfg.bucket_mode, 'split_mode': split_mode,
+        'bucket_mode': cfg.bucket_mode, 'reference': ref.name,
+        'split_mode': split_mode,
         'makespan_us': makespan, 'floor_us': floor, 'floor_job': floor_id,
         'compiles_per_gpu': [
             len([g for g in gr if not g.shared]) for gr in groups],
@@ -302,7 +305,9 @@ def report(
     groups: list[list[Group]], meta: dict, gpus: list[Gpu],
     jobs: list[Job] | None = None,
 ) -> None:
-    print(f"policy={meta['policy']} estimated total running time="
+    ref = reference_for(str(meta.get('reference') or 'standard'))
+    print(f"policy={meta['policy']} reference={ref.name} "
+          f"estimated total running time="
           f"{_fmt_s(int(meta.get('makespan_us') or 0))}")
     if (meta.get('floor_us') and meta.get('makespan_us')
             and meta['floor_us'] >= meta['makespan_us'] and len(gpus) > 1):
@@ -328,7 +333,7 @@ def report(
             print('    run order:')
             gpu_us = 0
             for i, g in enumerate(primary, 1):
-                inf_one = inference_us(inf1024, g.shape) if inf1024 else 0
+                inf_one = inference_us(inf1024, g.shape, ref) if inf1024 else 0
                 n_jobs = len(g.job_ids)
                 n_inf = 0
                 for jid in g.job_ids:
@@ -336,7 +341,7 @@ def report(
                     n_inf += job.n_seeds if job else 1
                 bucket_inf = n_inf * inf_one
                 per_job = int(round(bucket_inf / n_jobs)) if n_jobs else 0
-                gpu_us += compilation_us(compile_us, g.shape) + bucket_inf
+                gpu_us += compilation_us(compile_us, g.shape, ref) + bucket_inf
                 print(f'      {i}. bucket {g.shape}: {n_jobs} jobs, '
                       f'{_fmt_s(per_job)}/job, total {_fmt_s(bucket_inf)}')
             print(f'    estimated GPU time: {_fmt_s(gpu_us)}')

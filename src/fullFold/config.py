@@ -27,6 +27,7 @@ class Config:
     background_extract: bool = True
     policy: str = 'contiguous'  # contiguous | roundrobin
     bucket_mode: str = 'free'  # free | ladder
+    reference: str = 'standard'  # standard | fast
     buckets: tuple[int, ...] = DEFAULT_BUCKETS
     bucket_margin: float = 0.05
     stale_lock_seconds: int = 900

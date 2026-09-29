@@ -5,9 +5,10 @@ from __future__ import annotations
 import random
 
 from fullFold.scheduling import (
-    CSV_BUCKETS, CSV_MAX, INF, Group, candidate_shapes, compilation_modifier,
-    compilation_us, groups_cost_us, inference_modifier, inference_us, plan_gpu,
-    plan_multi_gpu, plan_round_robin, share_tails, shape_factor,
+    CSV_BUCKETS, CSV_MAX, FAST, INF, STANDARD, Group, candidate_shapes,
+    compilation_modifier, compilation_us, groups_cost_us, inference_modifier,
+    inference_us, plan_gpu, plan_multi_gpu, plan_round_robin, reference_for,
+    share_tails, shape_factor,
 )
 
 
@@ -136,6 +137,43 @@ def test_csv_lookup_matches_reference_rows():
     assert inference_us(1_000_000, 9) == inference_us(1_000_000, 10)
     assert compilation_modifier(6000) == compilation_modifier(CSV_MAX)
     assert compilation_modifier(CSV_MAX) == 1.40297111
+
+
+def test_fast_reference_matches_anthropic_rows():
+    assert reference_for('fast') is FAST
+    assert reference_for('standard') is STANDARD
+    assert inference_modifier(1024, FAST) == 1.0
+    assert compilation_modifier(1024, FAST) == 1.0
+    assert inference_us(1_000_000, 256, FAST) == round(1_000_000 * 0.133333333)
+    assert inference_us(1_000_000, 2048, FAST) == round(1_000_000 * 4.942764228)
+    assert compilation_us(1_000_000, 256, FAST) == round(1_000_000 * 0.96285448)
+    assert compilation_us(1_000_000, 2048, FAST) == round(1_000_000 * 1.005325523)
+    assert inference_us(1_000_000, 9, FAST) == inference_us(1_000_000, 16, FAST)
+    assert compilation_modifier(6000, FAST) == compilation_modifier(FAST.csv_max, FAST)
+    assert compilation_modifier(FAST.csv_max, FAST) == 1.242444415
+    assert inference_modifier(6000, FAST) == shape_factor(6000)
+    assert inference_us(1_000_000, 256, FAST) != inference_us(1_000_000, 256)
+
+
+def test_fast_free_mode_uses_fast_buckets():
+    work = [_w(1, 1, 'a'), _w(9, 1, 'b'), _w(16, 1, 'c'), _w(17, 1, 'd')]
+    shapes = candidate_shapes(work, (128, 256), 'free', FAST)
+    assert shapes == [s for s in FAST.buckets if 8 <= s <= 24]
+    assert 10 not in shapes
+    assert 17 not in shapes
+
+
+def test_fast_reference_changes_compile_choice():
+    """Compile at 128 is relatively dearer on the fast curve, so the DP merges."""
+    work = [_w(128, 1, 'a'), _w(256, 1, 'b')]
+    gpu, shapes = (55_000, 1_000_000), [128, 256]
+    _, standard = plan_gpu(work, gpu, shapes)
+    _, fast = plan_gpu(work, gpu, shapes, FAST)
+    assert [g.shape for g in standard] == [128, 256]
+    assert [g.shape for g in fast] == [256]
+    cost, _, _, _ = plan_multi_gpu(work, [gpu], shapes, ref=FAST)
+    assert cost == compilation_us(55_000, 256, FAST) + 2 * inference_us(
+        1_000_000, 256, FAST)
 
 
 def test_free_mode_uses_csv_buckets_not_ceil_8():

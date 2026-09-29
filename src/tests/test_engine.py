@@ -329,6 +329,19 @@ def test_cli_verbose_flag(monkeypatch, tmp_path):
     assert seen['verbose'] is True
 
 
+def test_fast_reference_plans_against_fast_buckets(tmp_path: Path):
+    inp, out = tmp_path / 'in', tmp_path / 'out'
+    _write_job(inp, 'tiny', 9)
+    cfg = Config(input_dir=inp, output_dir=out, reference='fast')
+    jobs, _ = scan(cfg)
+    groups, meta = make_plan(cfg, jobs, _benches())
+    assert meta['reference'] == 'fast'
+    assert jobs[0].tokens == 9
+    shapes = [g.shape for gr in groups for g in gr if not g.shared]
+    assert shapes == [16]
+    assert 10 not in meta['shapes']
+
+
 def test_cli_disable_prefetch_and_background_extract(monkeypatch, tmp_path):
     seen = {}
 
@@ -336,6 +349,7 @@ def test_cli_disable_prefetch_and_background_extract(monkeypatch, tmp_path):
         seen['prefetch'] = cfg.prefetch
         seen['background_extract'] = cfg.background_extract
         seen['bucket_mode'] = cfg.bucket_mode
+        seen['reference'] = cfg.reference
         return 0
 
     monkeypatch.setattr('fullFold.engine.cmd_run', fake_run)
@@ -346,11 +360,13 @@ def test_cli_disable_prefetch_and_background_extract(monkeypatch, tmp_path):
     assert seen['prefetch'] == 1
     assert seen['background_extract'] is True
     assert seen['bucket_mode'] == 'free'
+    assert seen['reference'] == 'standard'
     assert main(base + ['--no-prefetch', '--no-background-extract',
-                        '--bucket-mode', 'ladder']) == 0
+                        '--bucket-mode', 'ladder', '--reference', 'fast']) == 0
     assert seen['prefetch'] == 0
     assert seen['background_extract'] is False
     assert seen['bucket_mode'] == 'ladder'
+    assert seen['reference'] == 'fast'
 
 
 def test_ledger_written(tmp_path: Path):

@@ -27,6 +27,11 @@ def _add_sched(p: argparse.ArgumentParser) -> None:
                    action='store_false')
     p.add_argument('--policy', choices=('contiguous', 'roundrobin'), default='contiguous')
     p.add_argument('--bucket-mode', choices=('ladder', 'free'), default='free')
+    p.add_argument(
+        '--reference', choices=('standard', 'fast'), default='standard',
+        help='Timing reference for scheduling. fast uses Anthropic fast-mode '
+             'compile and inference modifiers.',
+    )
     p.add_argument('--buckets', type=_buckets, default=DEFAULT_BUCKETS)
     p.add_argument('--bucket-margin', type=float, default=0.05)
     p.add_argument('--stale-lock-seconds', type=int, default=900)

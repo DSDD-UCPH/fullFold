@@ -94,7 +94,7 @@ Resume is the same command: completed jobs (matching `done.json` hash) are skipp
 
 `--policy contiguous` (default) assigns jobs with DP, then rebalances and steals tails. `--policy roundrobin` is the fallback (also used if a GPU probe is contaminated).
 
-`--bucket-mode free` (default) compiles at the next `reference_timings.csv` bucket (ceil-8 only above 5216 tokens). `--bucket-mode ladder` intersects AlphaFold 3's default compile buckets with that CSV.
+`--bucket-mode free` (default) compiles at the next bucket in the active timing reference (ceil-8 only above 5216 tokens). `--bucket-mode ladder` intersects AlphaFold 3's default compile buckets with that reference. `--reference standard` (default) uses `reference_timings.csv`. `--reference fast` schedules against the Anthropic fast-mode modifiers in `reference_timing_fast.csv`.
 
 Prefetch and background-extract are on by default. Disable with `--no-prefetch` and `--no-background-extract`.
 
@@ -114,6 +114,7 @@ All tunables live in `config.py` (`Config`). Defaults:
 | `background_extract`          | `True`                    | Overlap one extract+write with the next same-bucket inference. Drains before compiling a new shape. `--no-background-extract` disables it                        |
 | `policy`                      | `contiguous`              | `contiguous` DP (then rebalance + steal tails), or `roundrobin` fallback                                                                                         |
 | `bucket_mode`                 | `free`                    | `free` = next CSV bucket (ceil-8 above 5216); `ladder` = AF3 buckets ∩ CSV                                                                                       |
+| `reference`                   | `standard`                | `standard` = `reference_timings.csv`; `fast` = Anthropic fast-mode modifiers in `reference_timing_fast.csv`                                                      |
 | `buckets`                     | AF3 128..5120             | Candidate compile shapes                                                                                                                                         |
 | `bucket_margin`               | `0.05`                    | Near-boundary token counts escalate to exact count                                                                                                               |
 | `stale_lock_seconds`          | `900`                     | Reclaim a lock whose mtime is older than this                                                                                                                    |

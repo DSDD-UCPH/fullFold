@@ -11,7 +11,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from fullFold.config import Config, host_id, worker_environ, write_atomic
-from fullFold.scheduling import compilation_modifier, inference_modifier
+from fullFold.scheduling import (
+    STANDARD, TimingRef, compilation_modifier, inference_modifier,
+)
 
 T_REF_S = 59.423  # A100 tokamax inference-only seconds at bucket 1024
 
@@ -44,14 +46,18 @@ def gpu_multiplier(bench: Bench) -> float:
     return s_s / T_REF_S
 
 
-def predict_inference_s(m_gpu: float, bucket: int) -> float:
+def predict_inference_s(
+    m_gpu: float, bucket: int, ref: TimingRef = STANDARD,
+) -> float:
     """T_predicted = m_gpu * inference_modifier(bucket) * T_REF, in seconds."""
-    return m_gpu * inference_modifier(bucket) * T_REF_S
+    return m_gpu * inference_modifier(bucket, ref) * T_REF_S
 
 
-def compile_overhead_ms(bench: Bench, shape: int) -> float:
+def compile_overhead_ms(
+    bench: Bench, shape: int, ref: TimingRef = STANDARD,
+) -> float:
     """Probe R at 1024 scaled by the CSV compile modifier (last-row above 5216)."""
-    return bench.r_ms * compilation_modifier(shape)
+    return bench.r_ms * compilation_modifier(shape, ref)
 
 
 def summarise_timings(t_ms: tuple[float, ...] | list[float]) -> tuple[float, float, bool]:

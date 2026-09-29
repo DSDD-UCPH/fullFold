@@ -8,14 +8,14 @@ A GPU that compiles shape `L` and then runs `k` inferences at that shape pays
 compilation_us(R, L) + k * inference_us(S, L)
 ```
 
-`R` and `S` are the 1024-token probe (`compile_us` and `infer_us_1024`). Per-bucket cost uses modifiers in `fullFold/data/reference_timings.csv` (`Inference_modifier`, `Compilation_modifier`; both `1.0` at 1024) through bucket **5216**:
+`R` and `S` are the 1024-token probe (`compile_us` and `infer_us_1024`). Per-bucket cost uses modifiers (`Inference_modifier`, `Compilation_modifier`; both `1.0` at 1024) through bucket **5216**. `--reference standard` (default) reads `fullFold/data/reference_timings.csv`. `--reference fast` reads `fullFold/data/reference_timing_fast.csv`, the Anthropic fast-mode compile and inference curve, and the scheduler optimises against that curve (candidate buckets in `free` mode are that file's `Bucket_size` values):
 
 ```
 inference_us(S, L)     = round(S * Inference_modifier[L])
 compilation_us(R, L)   = round(R * Compilation_modifier[L])
 ```
 
-A lookup at a size missing from the table snaps **up** to the next CSV bucket. Above 5216, inference uses the tokamax cubic and compile uses the last CSV compile modifier (5216 → 1.40297111) so compile does not follow the inference curve:
+A lookup at a size missing from the active table snaps **up** to the next CSV bucket. Above 5216, inference uses the tokamax cubic and compile uses the last compile modifier of the active table (standard 5216 → 1.40297111; fast 5216 → 1.242444415) so compile does not follow the inference curve:
 
 ```
 T_predicted(gpu, b) = m_gpu * f(b/1024) * T_REF     # inference only, b > 5216
@@ -40,7 +40,7 @@ Each GPU's manifest then appends the other GPUs' jobs **last-job-first** (`share
 
 Integer microseconds throughout. Ties broken by lowest index.
 
-`--bucket-mode=free` (default) compiles at CSV `Bucket_size` values: each job rounds up to the next CSV bucket, and intervening CSV sizes stay available so the inner DP can merge. Above 5216 it still rounds **up to a multiple of 8**. `--bucket-mode=ladder` intersects AF3's bucket list with the CSV set, then adds CSV-only extras the same way (next CSV, not a raw token count, unless the job is larger than 5216). Oversized jobs always get a formula extra (`free` → ceil 8, `ladder` → exact count).
+`--bucket-mode=free` (default) compiles at the active reference CSV's `Bucket_size` values: each job rounds up to the next CSV bucket, and intervening CSV sizes stay available so the inner DP can merge. Above 5216 it still rounds **up to a multiple of 8**. `--bucket-mode=ladder` intersects AF3's bucket list with that CSV set, then adds CSV-only extras the same way (next CSV, not a raw token count, unless the job is larger than 5216). Oversized jobs always get a formula extra (`free` → ceil 8, `ladder` → exact count). `--reference=fast` selects the Anthropic fast-mode table for both the modifiers and those buckets.
 
 If a probe is contaminated (seeds 3–4 disagree, so S is unusable), the planner falls back to round-robin. That still groups by shape. Tokamax compile on seeds 1 and 2, or a warm JAX cache (R ≈ 0), is not contamination: the contiguous DP still uses each GPU's throughput.
 
@@ -87,7 +87,7 @@ Scan order is `(bucket, tokens, sanitised_name, sha256)`, never filesystem mtime
 |---|---|
 | Default buckets, prefetch, thresholds | `Config` in `config.py` |
 | AF3 ModelRunner / write_fold_input_json | `runner.py` (installed `alphafold3` package) |
-| Per-bucket compile / inference modifiers | `data/reference_timings.csv`; `compilation_us` / `inference_us` in `scheduling.py` |
+| Per-bucket compile / inference modifiers | `data/reference_timings.csv` (`--reference standard`) or `data/reference_timing_fast.csv` (`--reference fast`); `compilation_us` / `inference_us` in `scheduling.py` |
 | T_REF (A100 @ 1024) | `T_REF_S` in `benchmark.py` |
 | Cost model / assignment | `scheduling.py` (keep it pure) |
 | AF3 output layout | `write_seed_outputs` / `write_job_final` in `worker.py` |
