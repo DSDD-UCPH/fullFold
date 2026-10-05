@@ -90,6 +90,11 @@ def _parse(path: Path, cfg: Config) -> Job:
     seeds = raw.get('modelSeeds')
     if not isinstance(seeds, list) or not seeds:
         raise ValueError('missing modelSeeds')
+    if cfg.num_seeds is not None:
+        if len(seeds) != 1:
+            raise ValueError('--num_seeds requires exactly one modelSeeds entry')
+        base = int(seeds[0])
+        seeds = [base + i for i in range(int(cfg.num_seeds))]
     n, exact = count_tokens(raw)
     escalate = (
         cfg.exact_tokens or not exact
@@ -107,12 +112,21 @@ def _parse(path: Path, cfg: Config) -> Job:
     )
 
 
+def _input_paths(cfg: Config) -> tuple[list[Path], list[str]]:
+    if cfg.json_path is not None:
+        path = Path(cfg.json_path)
+        if not path.is_file():
+            return [], [f'{path}: not a file']
+        return [path], []
+    root = Path(cfg.input_dir)
+    return [p for p in sorted(root.glob('*.json')) if p.is_file()], []
+
+
 def scan(cfg: Config) -> tuple[list[Job], list[str]]:
     jobs, rejected = [], []
-    root = Path(cfg.input_dir)
-    for path in sorted(root.glob('*.json')):
-        if not path.is_file():
-            continue
+    paths, missing = _input_paths(cfg)
+    rejected.extend(missing)
+    for path in paths:
         try:
             job = _parse(path, cfg)
         except Exception as e:

@@ -104,15 +104,14 @@ def write_seed_outputs(*, seed, inference_results, embeddings, distogram,
             (d / f'{job_name}_seed-{seed}_distogram.npz').write_bytes(bio.getvalue())
 
 
-def write_job_final(*, output_dir, job_name, compress, save_terms, rank):
+def write_job_final(*, output_dir, job_name, compress, save_terms, rank,
+                    model='alphafold3'):
     from alphafold3.model import post_processing
-    from etils import epath
-    import alphafold3.cpp
+    from fullFold.runner import output_terms
     best = rank.get('best_result')
     if best is None:
         return
-    terms = ((epath.Path(alphafold3.cpp.__file__).parent / 'OUTPUT_TERMS_OF_USE.md').read_text()
-             if save_terms else None)
+    terms = output_terms(model) if save_terms else None
     post_processing.write_output(
         inference_result=best, output_dir=output_dir, terms_of_use=terms,
         name=job_name, compress=compress, keep_license=save_terms)
@@ -120,19 +119,15 @@ def write_job_final(*, output_dir, job_name, compress, save_terms, rank):
         csv.writer(f).writerows([['seed', 'sample', 'ranking_score'], *rank['scores']])
 
 
-def featurise_one(fold_input, seed: int, buckets: list[int], ccd=None):
-    from alphafold3.constants import chemical_components
-    from alphafold3.data import featurisation
-    one = dataclasses.replace(fold_input, rng_seeds=[seed])
-    ccd = ccd or chemical_components.Ccd(user_ccd=fold_input.user_ccd)
-    return featurisation.featurise_input(
-        fold_input=one, ccd=ccd, buckets=buckets, verbose=False)[0]
+def featurise_one(fold_input, seed: int, buckets: list[int], ccd=None, cfg=None):
+    from fullFold.runner import featurise_fold
+    return featurise_fold(fold_input, seed, buckets, ccd=ccd, cfg=cfg)
 
 
-def _default_feat(job, seed, shape):
+def _default_feat(job, seed, shape, cfg=None):
     from alphafold3.common import folding_input
     fold = folding_input.Input.from_json(job.path.read_text(), job.path)
-    return featurise_one(fold, seed, [shape])
+    return featurise_one(fold, seed, [shape], cfg=cfg)
 
 
 def run_pipeline(items, cfg: Config, *, featurise_fn=None, infer_fn=None,
@@ -245,7 +240,7 @@ def run_pipeline(items, cfg: Config, *, featurise_fn=None, infer_fn=None,
                         log_fp, event='seed_done', job=job.job_id, seed=seed,
                         feat_ms=round(feat_ms, 3), infer_ms=round(inf_ms, 3))
                 if st['seeds_done'] == job.n_seeds and not st['failed']:
-                    write_final_fn(rank=st['rank'], **_kw(cfg, job))
+                    write_final_fn(rank=st['rank'], model=cfg.model, **_kw(cfg, job))
                     stats['jobs_ok'] += 1
                     if log_fp:
                         log_event(
@@ -288,7 +283,9 @@ def run_jobs(chunks, cfg: Config, *, featurise_fn=None, infer_fn=None,
              extract_fn=None, write_seed_fn=None, write_final_fn=None,
              log_fp=None, live=None, setup_fn=None) -> dict:
     """chunks: (job, shape). Prefetch>0 prepares job B while job A infers."""
-    featurise_fn = featurise_fn or _default_feat
+    if featurise_fn is None:
+        def featurise_fn(job, seed, shape, _cfg=cfg):
+            return _default_feat(job, seed, shape, cfg=_cfg)
     stats: dict[str, Any] = {
         'compiles': 0, 'jobs_ok': 0, 'jobs_fail': 0, 'max_live': 0}
     seen: set[int] = set()
@@ -447,8 +444,11 @@ def _infer(*_):
 
 
 def _bind_runner(cfg: Config):
+    from fullFold.runner import (
+        ModelRunner, install_fast_mode, make_model_config, resolve_model_dir,
+    )
+    install_fast_mode(cfg)
     import jax
-    from fullFold.runner import ModelRunner, make_model_config
     cache = os.environ.get('AF3SCHED_JAX_CACHE') or str(jax_cache_dir(
         cfg, physical_id=os.environ.get('CUDA_VISIBLE_DEVICES', '0')))
     Path(cache).mkdir(parents=True, exist_ok=True)
@@ -470,8 +470,9 @@ def _bind_runner(cfg: Config):
             num_diffusion_samples=cfg.num_diffusion_samples,
             num_recycles=cfg.num_recycles,
             return_embeddings=cfg.save_embeddings,
-            return_distogram=cfg.save_distogram),
-        device=devices[0], model_dir=cfg.model_dir)
+            return_distogram=cfg.save_distogram,
+            model_name=cfg.model),
+        device=devices[0], model_dir=resolve_model_dir(cfg))
     _ = runner.model_params
 
     def infer(job, seed, batch):
@@ -492,18 +493,13 @@ def run_probe(gpu_physical_id: str, cfg: Config) -> list[float]:
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_physical_id)
     os.environ.setdefault('CUDA_DEVICE_ORDER', 'PCI_BUS_ID')
     from alphafold3.common import folding_input
-    from alphafold3.constants import chemical_components
-    from alphafold3.data import featurisation
     from fullFold.benchmark import build_probe_json
     infer, extract = _bind_runner(cfg)
     fold = folding_input.Input.from_json(
         json.dumps(build_probe_json(1024, cfg.bench_seed)))
-    ccd = chemical_components.Ccd(user_ccd=fold.user_ccd)
     times = []
     for seed in fold.rng_seeds:
-        batch = featurisation.featurise_input(
-            fold_input=dataclasses.replace(fold, rng_seeds=[seed]),
-            ccd=ccd, buckets=[1024], verbose=False)[0]
+        batch = featurise_one(fold, seed, [1024], cfg=cfg)
         t0 = time.time()
         job = type('J', (), {'name': fold.name})()
         extract(job, seed, batch, infer(job, seed, batch))
@@ -557,6 +553,12 @@ def worker_main(argv: list[str] | None = None) -> int:
     p.add_argument('--probe', action='store_true')
     p.add_argument('--gpu', default='')
     p.add_argument('--flash-attention', default='')
+    p.add_argument('--mode', default='off')
+    p.add_argument('--model', default='alphafold3')
+    p.add_argument('--num-recycles', type=int, default=10)
+    p.add_argument('--num-diffusion-samples', type=int, default=5)
+    p.add_argument('--download-weights', action='store_true')
+    p.add_argument('--weights-precision', default='int8')
     args = p.parse_args(argv)
     # AF3 imports absl. First logging.info() parses sys.argv; --probe/--gpu
     # are unknown to absl and would abort the process with exit 1.
@@ -564,8 +566,14 @@ def worker_main(argv: list[str] | None = None) -> int:
     if args.gpu:
         os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
     os.environ.setdefault('CUDA_DEVICE_ORDER', 'PCI_BUS_ID')
-    kw = dict(output_dir=args.output_dir, model_dir=args.model_dir,
-              prefetch=args.prefetch)
+    kw = dict(
+        output_dir=args.output_dir, model_dir=args.model_dir,
+        prefetch=args.prefetch, mode=args.mode, model=args.model,
+        num_recycles=args.num_recycles,
+        num_diffusion_samples=args.num_diffusion_samples,
+        download_weights=args.download_weights,
+        weights_precision=args.weights_precision,
+    )
     if args.flash_attention:
         kw['flash_attention'] = args.flash_attention
     cfg = Config(**kw)

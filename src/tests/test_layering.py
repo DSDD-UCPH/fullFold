@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1] / 'fullFold'
 MODS = (
     'config', 'tokens', 'jobs', 'scheduling', 'benchmark',
-    'runner', 'worker', 'engine', 'templates', 'cli', 'banner',
+    'runner', 'worker', 'engine', 'templates', 'cli', 'banner', 'af3args',
 )
 
 

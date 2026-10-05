@@ -10,7 +10,8 @@ import time
 from pathlib import Path
 
 from fullFold.benchmark import (
-    Bench, Gpu, discover_gpus, get_or_measure, gpu_multiplier, to_scheduler_gpu,
+    Bench, Gpu, discover_gpus, get_or_measure, gpu_multiplier, is_probed,
+    to_scheduler_gpu,
 )
 from fullFold.config import (
     Config, config_hash, config_to_dict, worker_environ, write_atomic,
@@ -18,7 +19,8 @@ from fullFold.config import (
 from fullFold.jobs import Job, scan
 from fullFold.scheduling import (
     Group, candidate_shapes, compilation_us, groups_cost_us, inference_us,
-    job_floor_us, plan_multi_gpu, plan_round_robin, reference_for, share_tails,
+    job_floor_us, kernel_tile_shapes, listed_shapes, plan_multi_gpu, plan_round_robin,
+    reference_for, share_tails,
 )
 
 
@@ -76,7 +78,12 @@ def make_plan(
     work = [(j.tokens, j.n_seeds, j.job_id) for j in jobs]
     gpus = [g for g, _ in gpu_benches]
     ref = reference_for(cfg.reference)
-    shapes = candidate_shapes(work, cfg.buckets, cfg.bucket_mode, ref)
+    if cfg.mode == 'fast' and not cfg.buckets_explicit:
+        shapes = kernel_tile_shapes(work)
+    elif cfg.mode == 'fast':
+        shapes = listed_shapes(work, cfg.buckets)
+    else:
+        shapes = candidate_shapes(work, cfg.buckets, cfg.bucket_mode, ref)
     contaminated = any(b.contaminated for _, b in gpu_benches)
     policy = 'roundrobin' if (contaminated or cfg.policy == 'roundrobin') else cfg.policy
     split_mode = 'exact' if len(work) <= cfg.exact_split_threshold else 'coarsened'
@@ -91,18 +98,22 @@ def make_plan(
         makespan, floor, floor_id, groups = plan_multi_gpu(
             work, sched_gpus, shapes, cfg.exact_split_threshold, ref)
     groups = share_tails(groups, work, shapes, sched_gpus, ref)
+    probed = all(is_probed(b) for _, b in gpu_benches)
     gpu_rows = []
     for (g, b), (cu, inf1024) in zip(gpu_benches, sched_gpus):
-        gpu_rows.append({
+        row = {
             'slot': g.slot, 'physical_id': g.physical_id, 'kind': g.device_kind,
             's_ms': b.s_ms, 'r_ms': b.r_ms, 'contaminated': b.contaminated,
             'compile_us': cu, 'infer_us_1024': inf1024,
-            'm_gpu': round(gpu_multiplier(b), 4),
-        })
+        }
+        if probed:
+            row['m_gpu'] = round(gpu_multiplier(b), 4)
+        gpu_rows.append(row)
     meta = {
         'config_hash': config_hash(cfg), 'n_jobs': len(jobs), 'policy': policy,
         'bucket_mode': cfg.bucket_mode, 'reference': ref.name,
-        'split_mode': split_mode,
+        'mode': cfg.mode, 'model': cfg.model,
+        'split_mode': split_mode, 'probed': probed,
         'makespan_us': makespan, 'floor_us': floor, 'floor_job': floor_id,
         'compiles_per_gpu': [
             len([g for g in gr if not g.shared]) for gr in groups],
@@ -114,6 +125,12 @@ def make_plan(
 
 def _fmt_s(us: int) -> str:
     return f'{us / 1e6:.1f}s'
+
+
+def _fmt_cost(us: int, probed: bool) -> str:
+    if probed:
+        return _fmt_s(us)
+    return f'{us / 1e6:.1f}'
 
 
 BAR_WIDTH = 12
@@ -306,9 +323,17 @@ def report(
     jobs: list[Job] | None = None,
 ) -> None:
     ref = reference_for(str(meta.get('reference') or 'standard'))
+    probed = bool(meta.get('probed', True))
+    total_label = (
+        'estimated total running time=' if probed else 'relative total cost=')
     print(f"policy={meta['policy']} reference={ref.name} "
-          f"estimated total running time="
-          f"{_fmt_s(int(meta.get('makespan_us') or 0))}")
+          f"{total_label}{_fmt_cost(int(meta.get('makespan_us') or 0), probed)}")
+    if not probed:
+        print(
+            'Note: no GPU benchmark for this host and mode; cost is '
+            'relative to the timing table (1.0 = one 1024-token inference). '
+            'Run fullfold benchmark for time estimates.',
+        )
     if (meta.get('floor_us') and meta.get('makespan_us')
             and meta['floor_us'] >= meta['makespan_us'] and len(gpus) > 1):
         print(f"WARNING: job {meta['floor_job']!r} is the makespan floor "
@@ -324,7 +349,7 @@ def report(
         inf1024 = int(info.get('infer_us_1024') or 0)
         compile_us = int(info.get('compile_us') or 0)
         m_gpu = info.get('m_gpu')
-        extra = f', m_gpu={m_gpu}' if m_gpu is not None else ''
+        extra = f', m_gpu={m_gpu}' if probed and m_gpu is not None else ''
         print(f"  GPU {gpu.slot} ({gpu.device_kind}): {n} jobs{extra}")
         if not primary:
             print('    (no buckets)')
@@ -343,8 +368,10 @@ def report(
                 per_job = int(round(bucket_inf / n_jobs)) if n_jobs else 0
                 gpu_us += compilation_us(compile_us, g.shape, ref) + bucket_inf
                 print(f'      {i}. bucket {g.shape}: {n_jobs} jobs, '
-                      f'{_fmt_s(per_job)}/job, total {_fmt_s(bucket_inf)}')
-            print(f'    estimated GPU time: {_fmt_s(gpu_us)}')
+                      f'{_fmt_cost(per_job, probed)}/job, total '
+                      f'{_fmt_cost(bucket_inf, probed)}')
+            gpu_label = 'estimated GPU time' if probed else 'relative GPU cost'
+            print(f'    {gpu_label}: {_fmt_cost(gpu_us, probed)}')
             shape_sets.append({g.shape for g in primary})
         if steal:
             n_steal = sum(len(g.job_ids) for g in steal)
@@ -358,11 +385,15 @@ def report(
 
 def summarise_run(cfg: Config, meta: dict, wall_s: float) -> None:
     root = cfg.output_dir / '_af3sched'
-    pred_s = meta['makespan_us'] / 1e6 if meta.get('makespan_us') else 0
-    print(f'estimated running time: {pred_s:.1f}s')
-    print(f'actual running time:    {wall_s:.1f}s')
-    if pred_s > 0:
-        print(f'actual / estimated:     {wall_s / pred_s:.2f}x')
+    probed = bool(meta.get('probed', True))
+    if probed:
+        pred_s = meta['makespan_us'] / 1e6 if meta.get('makespan_us') else 0
+        print(f'estimated running time: {pred_s:.1f}s')
+        print(f'actual running time:    {wall_s:.1f}s')
+        if pred_s > 0:
+            print(f'actual / estimated:     {wall_s / pred_s:.2f}x')
+    else:
+        print(f'actual running time:    {wall_s:.1f}s')
     for i, exp in enumerate(meta.get('compiles_per_gpu') or []):
         path = root / f'gpu{i}.jsonl'
         got = 0
@@ -382,12 +413,12 @@ def cmd_scan(cfg: Config) -> int:
     return 0
 
 
-def _gpus_and_benches(cfg: Config):
-    return get_or_measure(discover_gpus(cfg), cfg)
+def _gpus_and_benches(cfg: Config, *, require: bool = False):
+    return get_or_measure(discover_gpus(cfg), cfg, require=require)
 
 
 def cmd_benchmark(cfg: Config) -> int:
-    for g, b in _gpus_and_benches(cfg):
+    for g, b in _gpus_and_benches(cfg, require=True):
         print(f'GPU {g.slot} {g.device_kind}: S={b.s_ms:.1f}ms R={b.r_ms:.1f}ms '
               f'contaminated={b.contaminated} t={b.t_ms}')
     return 0

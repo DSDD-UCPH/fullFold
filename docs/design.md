@@ -57,7 +57,7 @@ infer_us_1024 = round(m_gpu * T_REF * 1e6)
 
 Job cost at bucket `b` is `n_seeds * inference_us(infer_us_1024, b)`, not `tokens * us_per_token`. `compile_overhead_ms(bench, shape)` and `compilation_us` scale probe `R` by the CSV compile modifier (last-row modifier above 5216).
 
-Cache key: `<host_id>__<pci_bus_id>|<device_kind>|<jax_version>|<af3_version>.json` under `~/.cache/fullFold/bench/`. `host_id` is `/etc/machine-id` or a hostname hash. Cache misses are probed concurrently, one subprocess per GPU, so the parent process never initialises CUDA.
+Cache key: `<host_id>__<pci_bus_id>|<device_kind>|<jax_version>|<af3_version>|<mode>|<model>.json` under `~/.cache/fullFold/bench/`. `host_id` is `/etc/machine-id` or a hostname hash. `--mode fast` and `--mode off` are distinct files. A cache hit on one PCI is reused for every selected GPU of that `device_kind` so identical cards keep the same `m_gpu`. Live probes run when `fullfold benchmark` or `--force-benchmark` is used, or when two or more `device_kind` values are selected and some kind still has no sample. Otherwise the planner uses unit costs `(compile_us, infer_us_1024) = (1e6, 1e6)` and `plan.json` records `probed: false`; `report` then prints relative modifier cost (1.0 = one 1024-token inference) instead of estimated seconds. Unit benches are not written to the cache. Required probes of missing cards still run concurrently, one subprocess per target, so the parent process never initialises CUDA.
 
 Workers and probes always enable the JAX persistent compilation cache. The directory is `<cache_dir>/jax/<host_id>__<sanitised device_kind>/` unless `--jax-compilation-cache-dir` overrides the root. `device_kind` is the nvidia-smi GPU name, matching JAX's persistent-cache topology (a GPU-name string, not compute capability). Two cards with the same name on one host share the directory; A100 40GB vs 80GB, or A100 vs A30, do not, because JAX will not reuse those executables. The probe JSON stays per PCI.
 
@@ -87,6 +87,7 @@ Scan order is `(bucket, tokens, sanitised_name, sha256)`, never filesystem mtime
 |---|---|
 | Default buckets, prefetch, thresholds | `Config` in `config.py` |
 | AF3 ModelRunner / write_fold_input_json | `runner.py` (installed `alphafold3` package) |
+| af3-faster kernels, `--model`, `run_alphafold.py` flags | `af3args.py`, `runner.py`, `cli.py`. `--mode fast` is opt-in. `openfold3` / `openbind0` are ColabFold-only choices |
 | Per-bucket compile / inference modifiers | `data/reference_timings.csv` (`--reference standard`) or `data/reference_timing_fast.csv` (`--reference fast`); `compilation_us` / `inference_us` in `scheduling.py` |
 | T_REF (A100 @ 1024) | `T_REF_S` in `benchmark.py` |
 | Cost model / assignment | `scheduling.py` (keep it pure) |

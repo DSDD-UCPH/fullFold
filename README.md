@@ -26,7 +26,7 @@ Then run `fullfold` / `fullFold` (same command) or `python -m fullFold` from any
 
 ## Quickstart
 
-The main command that does everything (it will run a few minute benchmark the first time):
+The main command that does everything. On a single GPU, or several GPUs of the same nvidia-smi name, it skips the live probe and reports relative cost from the timing table. Mixed GPU names still run a few-minute benchmark so the planner can weight them. `fullfold benchmark` measures every GPU and caches the result for later wall-clock estimates:
 
 ```bash
 fullfold run --input-dir jobs/ --output-dir results/ --model-dir /path/to/models
@@ -81,8 +81,8 @@ Resume is the same command: completed jobs (matching `done.json` hash) are skipp
 | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
 | `run`       | All-in-one command: will run scan the AF3 json, plan them, and then execute. `--dry-run` stops after plan                                      |
 | `scan`      | Verify and calculate the tokens for every `*.json` in `--input-dir` (writes `ledger.jsonl`)                                                    |
-| `benchmark` | benchmark of the available GPUs for a 1024-token 4-seed probe per GPU; cached under `~/.cache/fullFold/bench/`                                 |
-| `plan`      | Scan + benchmark (on cache miss) + write per-GPU manifests                                                                                     |
+| `benchmark` | 1024-token 4-seed probe per GPU; cached under `~/.cache/fullFold/bench/` (separate files for `--mode off` and `--mode fast`) |
+| `plan`      | Scan + write per-GPU manifests. Probes only on mixed GPU names, `--force-benchmark`, or a `benchmark` cache already on disk |
 | `template`  | Quickly setting up batch screens, from a template JSON file combined with each record in a FASTA / CSV / SMI file (one output JSON per record) |
 
 
@@ -94,7 +94,24 @@ Resume is the same command: completed jobs (matching `done.json` hash) are skipp
 
 `--policy contiguous` (default) assigns jobs with DP, then rebalances and steals tails. `--policy roundrobin` is the fallback (also used if a GPU probe is contaminated).
 
-`--bucket-mode free` (default) compiles at the next bucket in the active timing reference (ceil-8 only above 5216 tokens). `--bucket-mode ladder` intersects AlphaFold 3's default compile buckets with that reference. `--reference standard` (default) uses `reference_timings.csv`. `--reference fast` schedules against the Anthropic fast-mode modifiers in `reference_timing_fast.csv`.
+A cached probe for one nvidia-smi GPU name is reused for every selected card of that name. `plan` and `run` probe live only when two or more names are selected and some name has no cache, or when `--force-benchmark` is set. Without a probe, the plan uses the active `--reference` modifiers as relative cost (1.0 = one 1024-token inference) instead of estimated seconds. `fullfold benchmark` always probes cache misses.
+
+`--bucket-mode free` (default) compiles at the next bucket in the active timing reference (ceil-8 only above 5216 tokens). `--bucket-mode ladder` intersects AlphaFold 3's default compile buckets with that reference. `--reference standard` (default) uses `reference_timings.csv`. `--reference fast` schedules against the Anthropic fast-mode modifiers in `reference_timing_fast.csv`. That flag does not install faster kernels.
+
+## af3-faster, OpenFold weights, and AlphaFold flags
+
+`--mode` defaults to `off`. `--mode fast` installs [af3-faster](https://github.com/DSDD-UCPH/af3-faster) kernels in each worker and, unless you also pass `--reference`, schedules with the fast timing table. It requires the `af3-faster` package. Without `--buckets`, fast mode compiles multiples of 64 (64, 128, …, 5120). An explicit `--buckets` list is used as given; sizes that are not multiples of 64 produce a warning.
+
+`--model` defaults to `alphafold3`. On a ColabFold AlphaFold 3 install, `--help` also offers `openfold3` and `openbind0` (and the `of3` / `openbind` aliases). On a DeepMind install those choices are not shown. Weights are the matching blob in `--model-dir` (`openfold3.bin.zst`, `openbind0.bin.zst`). An `af3.bin.zst` in that directory is not reused for the other models. `--download_weights` (default true) may fetch a missing OpenFold blob through the installed ColabFold loader. AlphaFold 3 weights are never downloaded.
+
+`run`, `scan`, `plan`, and `benchmark` accept the same flags as `python run_alphafold.py`, including `--json_path`, `--input_dir`, `--output_dir`, `--model_dir`, `--num_recycles`, and `--flash_attention_implementation`. Existing hyphen flags are unchanged. A copied command looks like:
+
+```bash
+fullfold run --json_path=in.json --output_dir=out --model_dir=weights --num_recycles=3
+fullfold run --json_path=in.json --output_dir=out --model_dir=weights --model=openfold3 --mode=fast
+```
+
+fullFold still does not run genetic or template search. Data-pipeline flags are accepted and ignored, with one warning when they are set. `--run_inference=false` and flags that would change the model (`--nojit`, `--use_msa_server`, `--use_esm_embeddings`, `--cyclic`, `--dropout`, `--featurise_off`, `--precompile`) are rejected. `--gpu_device=N` selects that GPU when `--gpus` was not passed. `--num_seeds` expands a JSON file that contains exactly one seed.
 
 Prefetch and background-extract are on by default. Disable with `--no-prefetch` and `--no-background-extract`.
 
@@ -122,7 +139,7 @@ All tunables live in `config.py` (`Config`). Defaults:
 | `exact_split_threshold`       | `512`                     | Above this, coarsen multi-GPU split points                                                                                                                       |
 | `force_benchmark`             | `False`                   | Ignore the probe cache                                                                                                                                           |
 | `bench_seed`                  | `42`                      | RNG seed for the 1024-token probe protein                                                                                                                        |
-| `cache_dir`                   | `~/.cache/fullFold/bench` | Per-host, per-GPU probe cache                                                                                                                                    |
+| `cache_dir`                   | `~/.cache/fullFold/bench` | Per-host, per-PCI probe cache; the file name includes `device_kind`, `--mode`, and `--model`                                                                      |
 | `jax_compilation_cache_dir`   | `None`                    | Root for the per-host, per-GPU-name JAX compile cache (default `<cache_dir>/jax/<host>__<name>/`; reuse follows JAX's GPU-name topology, not compute capability) |
 | `xla_mem_fraction`            | `0.97`                    | `XLA_CLIENT_MEM_FRACTION` in workers                                                                                                                             |
 | `xla_preallocate`             | `True`                    | `XLA_PYTHON_CLIENT_PREALLOCATE`                                                                                                                                  |
@@ -137,6 +154,11 @@ All tunables live in `config.py` (`Config`). Defaults:
 | `num_recycles`                | `10`                      | Model recycle count                                                                                                                                              |
 | `num_diffusion_samples`       | `5`                       | Diffusion samples per seed                                                                                                                                       |
 | `flash_attention`             | `triton`                  | Flash-attention implementation                                                                                                                                   |
+| `json_path`                   | `None`                    | Single AlphaFold 3 JSON. Used instead of scanning `input_dir`                                                                                                   |
+| `mode`                        | `off`                     | `fast` installs af3-faster kernels. Stays `off` until `--mode fast`                                                                                             |
+| `model`                       | `alphafold3`              | `openfold3` and `openbind0` only on a ColabFold install                                                                                                         |
+| `num_seeds`                   | `None`                    | Expand one JSON seed to this many consecutive seeds                                                                                                              |
+| `download_weights`            | `True`                    | Fetch a missing OpenFold blob. Never downloads AlphaFold 3 parameters                                                                                           |
 
 
 

@@ -8,9 +8,10 @@ from pathlib import Path
 import pytest
 
 from fullFold.benchmark import (
-    Bench, Gpu, T_REF_S, cache_path, discover_gpus, get_or_measure, gpu_multiplier,
-    load_bench, measure, predict_inference_s, save_bench, summarise_timings,
-    to_scheduler_gpu, compile_overhead_ms,
+    Bench, Gpu, T_REF_S, UNPROBED_KEY, cache_path, discover_gpus, get_or_measure,
+    gpu_multiplier, is_probed, load_bench, measure, predict_inference_s,
+    save_bench, summarise_timings, to_scheduler_gpu, compile_overhead_ms,
+    unprobed_bench,
 )
 from fullFold.config import Config, host_id, jax_cache_dir, worker_environ
 
@@ -105,11 +106,82 @@ def test_load_bench_ignores_stale_contaminated_flag(tmp_path: Path):
     assert b.r_ms == pytest.approx(r)
 
 
-def test_cache_miss_measures(tmp_path: Path, capsys):
+def test_cache_miss_uses_unprobed_bench(tmp_path: Path, capsys):
+    cfg = Config(cache_dir=tmp_path)
+    g0 = Gpu(0, '0', 'u0', 'pci0', 'A100', 0)
+    g1 = Gpu(1, '1', 'u1', 'pci1', 'A100', 0)
+    calls = []
+
+    def fake_measure(g, c):
+        calls.append(g)
+        return Bench((10, 10, 10, 10), 10, 0, False, 'h', 'k')
+
+    out = get_or_measure([g0, g1], cfg, measure_fn=fake_measure)
+    assert calls == []
+    assert all(b.gpu_key == UNPROBED_KEY for _, b in out)
+    captured = capsys.readouterr()
+    assert 'benchmark of the available GPUs' not in captured.err
+    assert 'Note: no GPU benchmark' not in captured.out
+
+
+def test_same_kind_reuses_cached_probe(tmp_path: Path):
+    cfg = Config(cache_dir=tmp_path)
+    g0 = Gpu(0, '0', 'u0', 'pci0', 'A100', 0)
+    g1 = Gpu(1, '1', 'u1', 'pci1', 'A100', 0)
+    cached = Bench((1000, 200, 180, 220), 200, 400, False, 'h', 'k')
+    save_bench(cache_path(cfg, g0), cached)
+    calls = []
+
+    def fake_measure(g, c):
+        calls.append(g)
+        return cached
+
+    out = get_or_measure([g0, g1], cfg, measure_fn=fake_measure)
+    assert calls == []
+    assert out[0][1].s_ms == out[1][1].s_ms == 200
+    assert all(is_probed(b) for _, b in out)
+
+
+def test_mixed_kinds_measure_missing(tmp_path: Path, capsys):
+    cfg = Config(cache_dir=tmp_path)
+    g0 = Gpu(0, '0', 'u0', 'pci0', 'A100', 0)
+    g1 = Gpu(1, '1', 'u1', 'pci1', 'L40S', 0)
+    calls = []
+
+    def fake_measure(g, c):
+        calls.append(g.device_kind)
+        return Bench((10, 10, 10, 10), 10, 0, False, 'h', g.device_kind)
+
+    out = get_or_measure([g0, g1], cfg, measure_fn=fake_measure)
+    assert sorted(calls) == ['A100', 'L40S']
+    assert [b.gpu_key for _, b in out] == ['A100', 'L40S']
+    err = capsys.readouterr().err
+    assert 'A few-minute benchmark of the available GPUs is running (2 GPUs).' in err
+
+
+def test_mixed_kinds_probe_one_per_missing_kind(tmp_path: Path):
+    cfg = Config(cache_dir=tmp_path)
+    a0 = Gpu(0, '0', 'u0', 'pci0', 'A100', 0)
+    a1 = Gpu(1, '1', 'u1', 'pci1', 'A100', 0)
+    l0 = Gpu(2, '2', 'u2', 'pci2', 'L40S', 0)
+    calls = []
+
+    def fake_measure(g, c):
+        calls.append(g.slot)
+        return Bench((10, 10, 10, 10), 10, 0, False, 'h', g.device_kind)
+
+    out = get_or_measure([a0, a1, l0], cfg, measure_fn=fake_measure)
+    assert sorted(calls) == [0, 2]
+    assert out[0][1] is out[1][1]
+    assert out[0][1].gpu_key == 'A100'
+    assert out[2][1].gpu_key == 'L40S'
+
+
+def test_require_measures_homogeneous_miss(tmp_path: Path, capsys):
     cfg = Config(cache_dir=tmp_path)
     gpu = Gpu(0, '0', 'u', 'pci', 'A100', 0)
     b = Bench((10, 10, 10, 10), 10, 0, True, 'h', 'k')
-    out = get_or_measure([gpu], cfg, measure_fn=lambda g, c: b)
+    out = get_or_measure([gpu], cfg, measure_fn=lambda g, c: b, require=True)
     assert out[0][1].contaminated
     err = capsys.readouterr().err
     assert 'A few-minute benchmark of the available GPUs is running (1 GPU).' in err
@@ -209,3 +281,48 @@ def test_jax_cache_per_host_and_gpu_name(tmp_path: Path):
         cfg_override, physical_id='0', pci_bus_id='0000:01:00.0', device_kind='A100')
     assert over.parent == tmp_path / 'xla'
     assert over.name == f'{hid}__A100'
+
+
+def test_to_scheduler_gpu_unprobed_uses_cost_units():
+    from fullFold.benchmark import COST_UNIT_US
+    assert to_scheduler_gpu(unprobed_bench()) == (COST_UNIT_US, COST_UNIT_US)
+    assert not is_probed(unprobed_bench())
+
+
+def test_cache_path_splits_fast_and_off(tmp_path: Path):
+    gpu = Gpu(0, '0', 'u', 'pci', 'A100', 0)
+    off = cache_path(Config(cache_dir=tmp_path, mode='off'), gpu)
+    fast = cache_path(Config(cache_dir=tmp_path, mode='fast'), gpu)
+    assert off != fast
+    assert '|off|' in off.name
+    assert '|fast|' in fast.name
+
+
+def test_fast_mode_does_not_load_off_cache(tmp_path: Path):
+    gpu = Gpu(0, '0', 'u', 'pci', 'A100', 0)
+    off_cfg = Config(cache_dir=tmp_path, mode='off')
+    fast_cfg = Config(cache_dir=tmp_path, mode='fast')
+    save_bench(
+        cache_path(off_cfg, gpu),
+        Bench((1000, 200, 180, 220), 200, 400, False, 'h', 'k'),
+    )
+    calls = []
+
+    def fake_measure(g, c):
+        calls.append(g)
+        return Bench((9, 9, 9, 9), 9, 0, False, 'h', 'k')
+
+    out = get_or_measure([gpu], fast_cfg, measure_fn=fake_measure)
+    assert calls == []
+    assert out[0][1].gpu_key == UNPROBED_KEY
+    required = get_or_measure(
+        [gpu], fast_cfg, measure_fn=fake_measure, require=True)
+    assert calls == [gpu]
+    assert required[0][1].s_ms == 9
+
+
+def test_unprobed_bench_is_not_cached(tmp_path: Path):
+    cfg = Config(cache_dir=tmp_path)
+    gpu = Gpu(0, '0', 'u', 'pci', 'A100', 0)
+    get_or_measure([gpu], cfg, measure_fn=lambda g, c: None)
+    assert list(tmp_path.glob('*.json')) == []

@@ -16,6 +16,8 @@ from fullFold.scheduling import (
 )
 
 T_REF_S = 59.423  # A100 tokamax inference-only seconds at bucket 1024
+COST_UNIT_US = 1_000_000  # 1.0 = one compile or inference at bucket 1024
+UNPROBED_KEY = 'unprobed'
 
 
 @dataclass(frozen=True)
@@ -127,12 +129,20 @@ def discover_gpus(cfg: Config, rows: list[dict] | None = None) -> list[Gpu]:
     return gpus
 
 
-def gpu_key(gpu: Gpu, jax_version: str = '', af3_version: str = '') -> str:
-    return f'{gpu.pci_bus_id}|{gpu.device_kind}|{jax_version}|{af3_version}'
+def gpu_key(
+    gpu: Gpu, jax_version: str = '', af3_version: str = '',
+    mode: str = 'off', model: str = 'alphafold3',
+) -> str:
+    return (
+        f'{gpu.pci_bus_id}|{gpu.device_kind}|{jax_version}|{af3_version}'
+        f'|{mode}|{model}'
+    )
 
 
 def cache_path(cfg: Config, gpu: Gpu, jax_version: str = '', af3_version: str = '') -> Path:
-    return cfg.cache_dir / f'{host_id()}__{gpu_key(gpu, jax_version, af3_version)}.json'
+    return cfg.cache_dir / (
+        f'{host_id()}__{gpu_key(gpu, jax_version, af3_version, cfg.mode, cfg.model)}.json'
+    )
 
 
 def load_bench(path: Path) -> Bench | None:
@@ -170,12 +180,31 @@ def build_probe_json(n_tokens: int = 1024, rng_seed: int = 42) -> dict:
     }
 
 
+def unprobed_bench() -> Bench:
+    """Unit-cost stand-in when no probe has been run for this GPU kind.
+
+    ``to_scheduler_gpu`` maps this to ``(COST_UNIT_US, COST_UNIT_US)`` so the
+    CSV modifiers are used as relative cost, not wall-clock microseconds.
+    Not written to the on-disk probe cache.
+    """
+    t = (1500.0, 1500.0, 1000.0, 1000.0)
+    s, r, _ = summarise_timings(t)
+    return Bench(t_ms=t, s_ms=s, r_ms=r, contaminated=False,
+                 host='', gpu_key=UNPROBED_KEY)
+
+
+def is_probed(bench: Bench) -> bool:
+    return bench.gpu_key != UNPROBED_KEY
+
+
 def to_scheduler_gpu(bench: Bench) -> tuple[int, int]:
     """(compile_us, infer_us_1024) for scheduling.py.
 
     ``m_gpu = S_1024 / T_REF`` from the probe; inference at bucket b is
-    ``m_gpu * f(b/1024) * T_REF``.
+    ``m_gpu * f(b/1024) * T_REF``. Unprobed benches use modifier units.
     """
+    if not is_probed(bench):
+        return COST_UNIT_US, COST_UNIT_US
     compile_us = max(int(round(compile_overhead_ms(bench, 1024) * 1000)), 0)
     infer_us_1024 = max(1, int(round(gpu_multiplier(bench) * T_REF_S * 1e6)))
     return compile_us, infer_us_1024
@@ -192,7 +221,14 @@ def measure(gpu: Gpu, cfg: Config) -> Bench:
         '--model-dir', str(cfg.model_dir),
         '--output-dir', str(cfg.output_dir),
         '--flash-attention', cfg.flash_attention,
+        '--mode', cfg.mode,
+        '--model', cfg.model,
+        '--num-recycles', str(cfg.num_recycles),
+        '--num-diffusion-samples', str(cfg.num_diffusion_samples),
+        '--weights-precision', cfg.weights_precision,
     ]
+    if cfg.download_weights:
+        cmd.append('--download-weights')
     r = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if r.returncode != 0:
         detail = (r.stderr or r.stdout or '(no output)').strip()
@@ -204,35 +240,78 @@ def measure(gpu: Gpu, cfg: Config) -> Bench:
     if cont:
         warnings.warn(f'contaminated benchmark on GPU {gpu.physical_id}: t={t}')
     b = Bench(t_ms=tuple(t), s_ms=s, r_ms=r_ms, contaminated=cont,
-              host=host_id(), gpu_key=gpu_key(gpu))
+              host=host_id(), gpu_key=gpu_key(gpu, mode=cfg.mode, model=cfg.model))
     save_bench(cache_path(cfg, gpu), b)
     return b
 
 
-def get_or_measure(
-    gpus: list[Gpu], cfg: Config, measure_fn=None,
-) -> list[tuple[Gpu, Bench]]:
-    measure_fn = measure_fn or measure
-    out: list[tuple[Gpu, Bench]] = []
-    missing: list[Gpu] = []
+def _one_per_kind(gpus: list[Gpu]) -> list[Gpu]:
+    seen: set[str] = set()
+    out: list[Gpu] = []
     for g in gpus:
-        p = cache_path(cfg, g)
-        b = None if cfg.force_benchmark else load_bench(p)
-        if b is None:
-            missing.append(g)
-        else:
-            out.append((g, b))
-    if missing:
-        n = len(missing)
-        gpu_word = 'GPU' if n == 1 else 'GPUs'
-        print(
-            f'A few-minute benchmark of the available GPUs is running '
-            f'({n} {gpu_word}).',
-            file=sys.stderr,
-        )
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=n) as ex:
-            benches = list(ex.map(lambda g: measure_fn(g, cfg), missing))
-        out.extend(zip(missing, benches))
-        out.sort(key=lambda x: x[0].slot)
+        if g.device_kind in seen:
+            continue
+        seen.add(g.device_kind)
+        out.append(g)
     return out
+
+
+def get_or_measure(
+    gpus: list[Gpu], cfg: Config, measure_fn=None, *, require: bool = False,
+) -> list[tuple[Gpu, Bench]]:
+    """Load or produce a Bench per GPU.
+
+    A cache hit on one card is reused for every selected GPU of that
+    ``device_kind``. Live probes run when ``require`` / ``force_benchmark``
+    is set, or when more than one kind is selected and some kind still has
+    no sample. Otherwise missing identical GPUs get ``unprobed_bench``.
+    ``require=True`` probes every remaining cache miss and never synthesizes
+    unit benches.
+    """
+    measure_fn = measure_fn or measure
+    by_slot: dict[int, Bench] = {}
+    kind_sample: dict[str, Bench] = {}
+    if not cfg.force_benchmark:
+        for g in gpus:
+            b = load_bench(cache_path(cfg, g))
+            if b is None:
+                continue
+            by_slot[g.slot] = b
+            kind_sample.setdefault(g.device_kind, b)
+        for g in gpus:
+            if g.slot in by_slot:
+                continue
+            sample = kind_sample.get(g.device_kind)
+            if sample is not None:
+                by_slot[g.slot] = sample
+    missing = [g for g in gpus if g.slot not in by_slot]
+    if missing:
+        kinds = {g.device_kind for g in gpus}
+        must_probe = require or cfg.force_benchmark or len(kinds) > 1
+        if must_probe:
+            targets = (
+                missing if (require or cfg.force_benchmark)
+                else _one_per_kind(missing)
+            )
+            n = len(targets)
+            gpu_word = 'GPU' if n == 1 else 'GPUs'
+            print(
+                f'A few-minute benchmark of the available GPUs is running '
+                f'({n} {gpu_word}).',
+                file=sys.stderr,
+            )
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=n) as ex:
+                benches = list(ex.map(lambda g: measure_fn(g, cfg), targets))
+            probed_kind: dict[str, Bench] = {}
+            for g, b in zip(targets, benches):
+                by_slot[g.slot] = b
+                probed_kind[g.device_kind] = b
+            for g in missing:
+                if g.slot not in by_slot:
+                    by_slot[g.slot] = probed_kind[g.device_kind]
+        else:
+            unit = unprobed_bench()
+            for g in missing:
+                by_slot[g.slot] = unit
+    return [(g, by_slot[g.slot]) for g in gpus]

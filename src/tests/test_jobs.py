@@ -141,6 +141,37 @@ def test_config_roundtrip(tmp_path: Path):
     assert got.buckets == cfg.buckets
 
 
+def test_json_path_scans_one_file(tmp_path: Path):
+    inp, out = tmp_path / 'in', tmp_path / 'out'
+    inp.mkdir(); out.mkdir()
+    keep = _job_json(inp, 'keep', 'ACDE')
+    _job_json(inp, 'drop', 'AAAA')
+    cfg = Config(input_dir=inp, output_dir=out, json_path=keep)
+    jobs, rejected = scan(cfg)
+    assert rejected == []
+    assert [j.name for j in jobs] == ['keep']
+
+
+def test_num_seeds_expands_one_seed(tmp_path: Path):
+    inp, out = tmp_path / 'in', tmp_path / 'out'
+    inp.mkdir(); out.mkdir()
+    _job_json(inp, 'a', 'ACDE', seeds=(7,))
+    cfg = Config(input_dir=inp, output_dir=out, num_seeds=3)
+    jobs, rejected = scan(cfg)
+    assert rejected == []
+    assert jobs[0].seeds == (7, 8, 9)
+
+
+def test_num_seeds_rejects_multiple_json_seeds(tmp_path: Path):
+    inp, out = tmp_path / 'in', tmp_path / 'out'
+    inp.mkdir(); out.mkdir()
+    _job_json(inp, 'a', 'ACDE', seeds=(1, 2))
+    cfg = Config(input_dir=inp, output_dir=out, num_seeds=3)
+    jobs, rejected = scan(cfg)
+    assert jobs == []
+    assert 'num_seeds' in rejected[0]
+
+
 def test_scan_order_independent_of_mtime(tmp_path: Path):
     inp, out = tmp_path / 'in', tmp_path / 'out'
     inp.mkdir(); out.mkdir()

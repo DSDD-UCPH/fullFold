@@ -23,6 +23,8 @@ INF = 10**18
 Work = tuple[int, int, str]  # tokens, n_seeds, job_id
 Gpu = tuple[int, int]        # compile_us_1024, infer_us_1024
 FREE_ALIGN = 8  # --bucket-mode=free extras above CSV_MAX round up to this
+KERNEL_TILE = 64  # FlashPairformer fast mode wants N a multiple of this
+KERNEL_TILE_MAX = 5120
 SHAPE_REF = 1024
 _F_A, _F_B, _F_C = 0.33, 0.42, 0.27
 
@@ -142,6 +144,54 @@ def _cover(tokens: int, mode: str, ref: TimingRef = STANDARD) -> int:
     if mode == 'free':
         return _ceil_multiple(tokens)
     return tokens
+
+
+def listed_shapes(work: list[Work], buckets: tuple[int, ...] | list[int]) -> list[int]:
+    """Compile shapes taken from an explicit ``--buckets`` list.
+
+    Each job rounds up to the next listed size. A job larger than the list
+    gets its own exact token count, matching AlphaFold 3.
+    """
+    tokens = [w[0] for w in work]
+    ladder = tuple(sorted(int(b) for b in buckets))
+    if not tokens or not ladder:
+        return []
+
+    def cover(n: int) -> int:
+        for bucket in ladder:
+            if bucket >= n:
+                return bucket
+        return n
+
+    lo, top = cover(min(tokens)), cover(max(tokens))
+    out = {bucket for bucket in ladder if lo <= bucket <= top}
+    out.add(top)
+    return sorted(out)
+
+
+def kernel_tile_shapes(
+    work: list[Work], tile: int = KERNEL_TILE, hi: int = KERNEL_TILE_MAX,
+) -> list[int]:
+    """Compile shapes for af3-faster fast mode: multiples of ``tile`` through ``hi``.
+
+    Above ``hi``, cover with ``tile`` instead of the free-mode multiple of 8.
+    Cost lookups still use the active timing reference; this list is only the
+    shapes that are compiled.
+    """
+    tokens = [w[0] for w in work]
+    if not tokens:
+        return []
+
+    def cover(n: int) -> int:
+        if n <= hi:
+            return max(tile, _ceil_multiple(max(n, 1), tile))
+        return _ceil_multiple(n, tile)
+
+    lo, top = cover(min(tokens)), cover(max(tokens))
+    out = {b for b in range(tile, hi + 1, tile) if lo <= b <= top}
+    if top > hi:
+        out.add(top)
+    return sorted(out)
 
 
 def candidate_shapes(

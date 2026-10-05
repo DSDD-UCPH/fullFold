@@ -6,7 +6,7 @@ import io
 import json
 from pathlib import Path
 
-from fullFold.benchmark import Bench, Gpu
+from fullFold.benchmark import Bench, Gpu, COST_UNIT_US, unprobed_bench
 from fullFold.config import Config
 from fullFold.engine import (
     consume_worker_events, format_gpu_progress, make_plan, progress_lines,
@@ -56,6 +56,22 @@ def test_plan_compiles_equal_distinct_shapes(tmp_path: Path):
     assert man['config']['prefetch'] == 1
     assert 'groups' in man
     assert 'shared' in man['groups'][0]
+    assert meta['probed'] is True
+    assert 'm_gpu' in meta['gpus'][0]
+
+
+def test_make_plan_unprobed_uses_unit_costs(tmp_path: Path):
+    inp, out = tmp_path / 'in', tmp_path / 'out'
+    _write_job(inp, 's', 10)
+    cfg = Config(input_dir=inp, output_dir=out)
+    jobs, _ = scan(cfg)
+    g0 = Gpu(0, '0', 'u0', 'pci0', 'A100', 0)
+    groups, meta = make_plan(cfg, jobs, [(g0, unprobed_bench())])
+    assert groups
+    assert meta['probed'] is False
+    assert meta['gpus'][0]['compile_us'] == COST_UNIT_US
+    assert meta['gpus'][0]['infer_us_1024'] == COST_UNIT_US
+    assert 'm_gpu' not in meta['gpus'][0]
 
 
 def test_floor_warning_meta(tmp_path: Path):
@@ -165,6 +181,32 @@ def test_report_prints_per_gpu_bucket_order(capsys):
     assert 'steal tail: 1 jobs from other GPUs' in out
 
 
+def test_report_relative_cost_when_unprobed(capsys):
+    g0 = Gpu(0, '0', 'u0', 'pci0', 'A100', 0)
+    jobs = [
+        Job(path=Path('a'), name='a', sha256='x', tokens=10, bucket=128,
+            seeds=(1,), exact=True),
+        Job(path=Path('b'), name='b', sha256='x', tokens=20, bucket=128,
+            seeds=(1, 2), exact=True),
+    ]
+    groups = [[Group(shape=128, job_ids=('a', 'b'))]]
+    meta = {
+        'policy': 'contiguous', 'makespan_us': 1_500_000, 'floor_us': 0,
+        'floor_job': '', 'probed': False,
+        'gpus': [{'slot': 0, 'infer_us_1024': 1_000_000, 'compile_us': 1_000_000}],
+    }
+    report(groups, meta, [g0], jobs)
+    out = capsys.readouterr().out
+    assert 'relative total cost=1.5' in out
+    assert 'estimated total running time=' not in out
+    assert 'm_gpu=' not in out
+    assert 'relative GPU cost:' in out
+    assert 'estimated GPU time' not in out
+    assert '1.0 = one 1024-token inference' in out
+    assert 'fullfold benchmark' in out
+    assert 'relative total cost=1.5s' not in out
+
+
 def test_summarise_run_compares_actual_to_estimate(tmp_path: Path, capsys):
     cfg = Config(output_dir=tmp_path)
     summarise_run(cfg, {'makespan_us': 100_000_000, 'compiles_per_gpu': []}, 120.0)
@@ -172,6 +214,18 @@ def test_summarise_run_compares_actual_to_estimate(tmp_path: Path, capsys):
     assert 'estimated running time: 100.0s' in out
     assert 'actual running time:    120.0s' in out
     assert 'actual / estimated:     1.20x' in out
+
+
+def test_summarise_run_unprobed_omits_estimate(tmp_path: Path, capsys):
+    cfg = Config(output_dir=tmp_path)
+    summarise_run(
+        cfg, {'makespan_us': 2_000_000, 'probed': False, 'compiles_per_gpu': []},
+        12.0)
+    out = capsys.readouterr().out
+    assert 'actual running time:    12.0s' in out
+    assert 'estimated running time' not in out
+    assert 'actual / estimated' not in out
+    assert 'relative total cost' not in out
 
 
 def test_format_gpu_progress_includes_bar_bucket_and_counts():
@@ -327,6 +381,30 @@ def test_cli_verbose_flag(monkeypatch, tmp_path):
     assert seen['verbose'] is True
     assert main(base + ['-v']) == 0
     assert seen['verbose'] is True
+
+
+def test_fast_mode_compiles_kernel_tiles(tmp_path: Path):
+    inp, out = tmp_path / 'in', tmp_path / 'out'
+    _write_job(inp, 'tiny', 9)
+    cfg = Config(input_dir=inp, output_dir=out, mode='fast', reference='fast')
+    jobs, _ = scan(cfg)
+    groups, meta = make_plan(cfg, jobs, _benches())
+    shapes = [g.shape for gr in groups for g in gr if not g.shared]
+    assert shapes == [64]
+    assert meta['mode'] == 'fast'
+
+
+def test_fast_mode_keeps_explicit_buckets(tmp_path: Path):
+    inp, out = tmp_path / 'in', tmp_path / 'out'
+    _write_job(inp, 'tiny', 9)
+    cfg = Config(
+        input_dir=inp, output_dir=out, mode='fast', reference='fast',
+        buckets=(100, 200), buckets_explicit=True,
+    )
+    jobs, _ = scan(cfg)
+    groups, _ = make_plan(cfg, jobs, _benches())
+    shapes = [g.shape for gr in groups for g in gr if not g.shared]
+    assert shapes == [100]
 
 
 def test_fast_reference_plans_against_fast_buckets(tmp_path: Path):

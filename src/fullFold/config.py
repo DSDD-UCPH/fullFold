@@ -14,6 +14,24 @@ DEFAULT_BUCKETS = (
     4608, 5120,
 )
 
+# af3-faster FAST_ENV. Set in the worker process before JAX imports. Explicit
+# lever overrides are applied after setdefault so --no-sampler-bf16 sticks.
+FAST_ENV = {
+    'AF3_FLASHPAIRFORMER': 'both',
+    'AF3_DIFFUSION_HOIST': '1',
+    'AF3_JAX_DATTN': '1',
+    'AF3_JAX_TTR': 'fast',
+    'AF3_JAX_TRIATT_XLA': 'fast',
+    'AF3_JAX_SAMPLER_BF16': '1',
+    'AF3_JAX_ATOM_ATTN': '1',
+    'AF3_JAX_TRIMUL_CD': 'fast',
+    'AF3_JAX_LNP': 'fast',
+    'AF3_JAX_HOIST_LOGITS': '1',
+    'AF3_JAX_COND_SHARE': '1',
+    'AF3_JAX_ATOM_COND_HOIST': '1',
+}
+XLA_TRITON_GEMM_OFF = '--xla_gpu_enable_triton_gemm=false'
+
 
 @dataclasses.dataclass(frozen=True)
 class Config:
@@ -50,6 +68,20 @@ class Config:
     num_recycles: int = 10
     num_diffusion_samples: int = 5
     flash_attention: str = 'triton'
+    json_path: Path | None = None
+    mode: str = 'off'  # off | fast (af3-faster kernels; off unless --mode fast)
+    model: str = 'alphafold3'
+    buckets_explicit: bool = False
+    num_seeds: int | None = None
+    sampler_bf16: bool | None = None
+    hoist_logits: bool | None = None
+    download_weights: bool = True
+    weights_precision: str = 'int8'
+    conformer_max_iterations: int | None = None
+    resolve_msa_overlaps: bool = True
+    max_template_date: str = '2021-09-30'
+    fix_standalone_glycans: bool = False
+    force_output_dir: bool = False
 
 
 def host_id() -> str:
@@ -146,4 +178,13 @@ def worker_environ(
         device_kind=device_kind)
     cache.mkdir(parents=True, exist_ok=True)
     env['AF3SCHED_JAX_CACHE'] = str(cache)
+    if cfg.mode == 'fast':
+        if not (env.get('XLA_FLAGS') or '').strip():
+            env['XLA_FLAGS'] = XLA_TRITON_GEMM_OFF
+        for key, value in FAST_ENV.items():
+            env.setdefault(key, value)
+        if cfg.sampler_bf16 is not None:
+            env['AF3_JAX_SAMPLER_BF16'] = '1' if cfg.sampler_bf16 else '0'
+        if cfg.hoist_logits is not None:
+            env['AF3_JAX_HOIST_LOGITS'] = '1' if cfg.hoist_logits else '0'
     return env
