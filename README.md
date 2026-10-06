@@ -191,6 +191,6 @@ A preprint or publication describing **fullFold** is not yet available. In the m
 
 > Verhellen, J. & Kooistra, A. J. **fullFold: Unlocking the Full Speed of AlphaFold 3.** Version `<version>`. GitHub: `https://github.com/DSDD-UCPH/fullFold`.
 
-For reproducibility, please replace `<version>` with the fullFold release used in your analysis (for example, `v0.1.0`). If you used an unreleased version, please cite the corresponding Git commit hash in addition to the repository URL.
+For reproducibility, please replace `<version>` with the fullFold release used in your analysis (for example, `v0.1.1`). If you used an unreleased version, please cite the corresponding Git commit hash in addition to the repository URL.
 
 Once a preprint or publication becomes available, the recommended citation will be updated here.
