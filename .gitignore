@@ -6,3 +6,5 @@ dist/
 build/
 examples/_demo/
 .DS_Store
+_sched_eval
+docs/note

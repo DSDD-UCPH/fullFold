@@ -1,0 +1,35 @@
+{
+  "hashes": {
+    "atom_cross_attention._per_atom_conditioning": [
+      "0821be056973cd5dfa8a2975549fa14b623382e6417e507c6caa77bce063a270"
+    ],
+    "atom_cross_attention.atom_cross_att_decoder": [
+      "ec2e10bb93594df31242fd0b18c23674b81ee63d57fc9d13896b377e42a12804"
+    ],
+    "atom_cross_attention.atom_cross_att_encoder": [
+      "4375268b04591c818b9e30ca79406c4bdd652c212d26382032e94368f8a9818d"
+    ],
+    "diffusion_head.DiffusionHead.__call__": [
+      "cefd107f9caf1bd417b30db93e9445315422fd8bcf3807318d783672e0ae3229"
+    ],
+    "diffusion_head.DiffusionHead._conditioning": [
+      "9f7bccf1b8accea8a5f4ffda0256ad0941de12b5a0f3e0ef2e1b415410b9a374"
+    ],
+    "diffusion_head.noise_schedule": [
+      "7983e82346937a92c18217c74b68b8fd58d5509ac4c828d0a67d99ce6321b095"
+    ],
+    "diffusion_head.random_augmentation": [
+      "876faa73c3898f48ebcd29693baae418b69dfd8fc3b9774995327dffee37f6a4"
+    ],
+    "diffusion_head.sample": [
+      "453ef957e3f4fd0233ceac2d9f95b796106a492e5f0c4d748ba6ad635deeee8c"
+    ],
+    "diffusion_transformer.CrossAttTransformer.__call__": [
+      "a19b2c56b56c2d2e520ad7c38eba081a8efac84ea5b1a6d897078ddf740800d4"
+    ],
+    "model.Model._sample_diffusion": [
+      "71cf7eabdc80a6935c105269602d55723e9063b0a0745f0c8a0d84e49d840272"
+    ]
+  },
+  "target_version": "3.0.4"
+}

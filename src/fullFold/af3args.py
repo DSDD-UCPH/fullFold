@@ -111,9 +111,10 @@ class AbslBool(argparse.Action):
 def add_run_alphafold_flags(p: argparse.ArgumentParser, *, colabfold: bool) -> None:
     """Flags from run_alphafold.py that fullFold did not already define."""
     p.add_argument(
-        '--mode', choices=('off', 'fast'), default='off',
-        help='af3-faster kernels. off (default) leaves AlphaFold unchanged. '
-             'fast requires the af3-faster package.',
+        '--mode', choices=('default', 'off', 'fast'), default=None,
+        help='Inference kernels. Omit to pick fast when af3-faster is '
+             'installed, otherwise default (exact-math hoists). off is '
+             'stock AlphaFold 3. fast requires the af3-faster package.',
     )
     p.add_argument(
         '--model', choices=model_choices(colabfold), default='alphafold3',

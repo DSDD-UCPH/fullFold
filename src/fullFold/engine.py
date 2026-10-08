@@ -14,13 +14,14 @@ from fullFold.benchmark import (
     to_scheduler_gpu,
 )
 from fullFold.config import (
-    Config, config_hash, config_to_dict, worker_environ, write_atomic,
+    POLICIES, Config, config_hash, config_to_dict, worker_environ, write_atomic,
 )
 from fullFold.jobs import Job, scan
+from fullFold.planner import plan_multi_gpu_search
 from fullFold.scheduling import (
     Group, candidate_shapes, compilation_us, groups_cost_us, inference_us,
-    job_floor_us, kernel_tile_shapes, listed_shapes, plan_multi_gpu, plan_round_robin,
-    reference_for, share_tails,
+    job_floor_us, kernel_tile_shapes, listed_shapes, plan_round_robin, reference_for,
+    share_tails,
 )
 
 
@@ -85,8 +86,13 @@ def make_plan(
     else:
         shapes = candidate_shapes(work, cfg.buckets, cfg.bucket_mode, ref)
     contaminated = any(b.contaminated for _, b in gpu_benches)
+    if cfg.policy not in POLICIES:
+        raise ValueError(
+            f'unknown policy {cfg.policy!r}; expected one of {", ".join(POLICIES)} '
+            "(the contiguous-block planner was replaced by 'search')")
     policy = 'roundrobin' if (contaminated or cfg.policy == 'roundrobin') else cfg.policy
-    split_mode = 'exact' if len(work) <= cfg.exact_split_threshold else 'coarsened'
+    split_mode = 'roundrobin'
+    planner: dict = {}
     sched_gpus = [to_scheduler_gpu(b) for _, b in gpu_benches]
     if policy == 'roundrobin':
         groups = plan_round_robin(work, len(gpus), shapes, ref)
@@ -95,8 +101,9 @@ def make_plan(
         makespan = max(loads) if loads else 0
         floor, floor_id = job_floor_us(work, sched_gpus, shapes, ref)
     else:
-        makespan, floor, floor_id, groups = plan_multi_gpu(
-            work, sched_gpus, shapes, cfg.exact_split_threshold, ref)
+        makespan, floor, floor_id, groups = plan_multi_gpu_search(
+            work, sched_gpus, shapes, ref, effort=cfg.plan_effort, info=planner)
+        split_mode = planner.get('stage', 'search')
     groups = share_tails(groups, work, shapes, sched_gpus, ref)
     probed = all(is_probed(b) for _, b in gpu_benches)
     gpu_rows = []
@@ -113,6 +120,7 @@ def make_plan(
         'config_hash': config_hash(cfg), 'n_jobs': len(jobs), 'policy': policy,
         'bucket_mode': cfg.bucket_mode, 'reference': ref.name,
         'mode': cfg.mode, 'model': cfg.model,
+        'hoists': list(cfg.hoists),
         'split_mode': split_mode, 'probed': probed,
         'makespan_us': makespan, 'floor_us': floor, 'floor_job': floor_id,
         'compiles_per_gpu': [
@@ -120,6 +128,8 @@ def make_plan(
         'shapes': shapes,
         'contaminated': contaminated, 'gpus': gpu_rows,
     }
+    if planner:
+        meta['planner'] = {'effort': cfg.plan_effort, **planner}
     return groups, meta
 
 
@@ -156,13 +166,13 @@ def format_gpu_progress(
 ) -> str:
     gpu = f'GPU {slot} ({kind})' if kind else f'GPU {slot}'
     shown = min(done, total) if total else done
-    line = f'{gpu} {_ascii_bar(shown, total, width)} {shown}/{total}'
+    line = f'{gpu} {_ascii_bar(shown, total, width)} jobs={shown}/{total}'
     if bucket is not None:
-        line += f'  bucket={bucket}'
+        line += f' current_bucket={bucket}'
     if tokens is not None:
-        line += f'  tokens={tokens}'
+        line += f'  job_tokens={tokens}'
     if job_idx is not None and bucket_n is not None:
-        line += f'  job={job_idx}/{bucket_n}'
+        line += f'  jobs_in_bucket={job_idx}/{bucket_n}'
     return line
 
 
@@ -334,6 +344,13 @@ def report(
             'relative to the timing table (1.0 = one 1024-token inference). '
             'Run fullfold benchmark for time estimates.',
         )
+    plan_info = meta.get('planner') or {}
+    lower = int(plan_info.get('lower_bound_us') or 0)
+    if lower and meta.get('makespan_us'):
+        gap = 100.0 * (int(meta['makespan_us']) / lower - 1.0)
+        print(f"planner: effort={plan_info.get('effort')} stage={plan_info.get('stage')}; "
+              f"no plan can beat {_fmt_cost(lower, probed)}, this one is {gap:.1f}% above "
+              f"that bound (loose for few jobs)")
     if (meta.get('floor_us') and meta.get('makespan_us')
             and meta['floor_us'] >= meta['makespan_us'] and len(gpus) > 1):
         print(f"WARNING: job {meta['floor_job']!r} is the makespan floor "
@@ -377,7 +394,7 @@ def report(
             n_steal = sum(len(g.job_ids) for g in steal)
             print(f'    steal tail: {n_steal} jobs from other GPUs '
                   f'(skip if claimed)')
-    if len(shape_sets) > 1:
+    if len(shape_sets) > 1 and meta.get('policy') != 'search':
         shared = set.intersection(*shape_sets)
         if len(shared) > 1:
             print(f'WARNING: {len(shared)} compiled shapes are duplicated across GPUs')
@@ -460,7 +477,7 @@ def run_workers(
         for gpu in gpus:
             env = worker_environ(
                 cfg, gpu.physical_id, pci_bus_id=gpu.pci_bus_id,
-                device_kind=gpu.device_kind)
+                device_kind=gpu.device_kind, memory_bytes=gpu.memory_bytes)
             log_path = root / f'gpu{gpu.slot}.log'
             lf = log_path.open('a')
             logs.append(lf)

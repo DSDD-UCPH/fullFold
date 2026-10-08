@@ -6,6 +6,8 @@ import io
 import json
 from pathlib import Path
 
+import pytest
+
 from fullFold.benchmark import Bench, Gpu, COST_UNIT_US, unprobed_bench
 from fullFold.config import Config
 from fullFold.engine import (
@@ -57,6 +59,7 @@ def test_plan_compiles_equal_distinct_shapes(tmp_path: Path):
     assert 'groups' in man
     assert 'shared' in man['groups'][0]
     assert meta['probed'] is True
+    assert meta['hoists'] == []
     assert 'm_gpu' in meta['gpus'][0]
 
 
@@ -110,7 +113,7 @@ def test_inverted_r_keeps_contiguous(tmp_path: Path):
     g1 = Gpu(1, '1', 'u1', 'pci1', 'L40S', 0)
     warm = Bench((10, 10, 100, 100), 100.0, -180.0, False, 'h', 'k')
     _, meta = make_plan(cfg, jobs, [(g0, warm), (g1, warm)])
-    assert meta['policy'] == 'contiguous'
+    assert meta['policy'] == 'search'
     assert not meta['contaminated']
 
 
@@ -125,7 +128,7 @@ def test_faster_gpu_gets_more_jobs(tmp_path: Path):
     fast = Bench((70_000, 67_000, 45_000, 45_000), 45_000.0, 47_000.0, False, 'h', 'k')
     slow = Bench((110_000, 105_000, 74_000, 74_000), 74_000.0, 67_000.0, False, 'h', 'k')
     groups, meta = make_plan(cfg, jobs, [(g0, fast), (g1, slow)])
-    assert meta['policy'] == 'contiguous'
+    assert meta['policy'] == 'search'
     n0 = sum(len(g.job_ids) for g in groups[0] if not g.shared)
     n1 = sum(len(g.job_ids) for g in groups[1] if not g.shared)
     assert n0 > n1
@@ -159,7 +162,7 @@ def test_report_prints_per_gpu_bucket_order(capsys):
     ]
     inf1024 = 59_423_000
     meta = {
-        'policy': 'contiguous', 'makespan_us': inf1024, 'floor_us': 0,
+        'policy': 'roundrobin', 'makespan_us': inf1024, 'floor_us': 0,
         'floor_job': '',
         'gpus': [
             {'slot': 0, 'infer_us_1024': inf1024, 'compile_us': 0, 'm_gpu': 1.0},
@@ -191,7 +194,7 @@ def test_report_relative_cost_when_unprobed(capsys):
     ]
     groups = [[Group(shape=128, job_ids=('a', 'b'))]]
     meta = {
-        'policy': 'contiguous', 'makespan_us': 1_500_000, 'floor_us': 0,
+        'policy': 'roundrobin', 'makespan_us': 1_500_000, 'floor_us': 0,
         'floor_job': '', 'probed': False,
         'gpus': [{'slot': 0, 'infer_us_1024': 1_000_000, 'compile_us': 1_000_000}],
     }
@@ -232,7 +235,8 @@ def test_format_gpu_progress_includes_bar_bucket_and_counts():
     line = format_gpu_progress(
         0, 'A100', 24, 40, bucket=256, tokens=198, job_idx=3, bucket_n=8)
     assert line == (
-        'GPU 0 (A100) [======>     ] 24/40  bucket=256  tokens=198  job=3/8')
+        'GPU 0 (A100) [======>     ] jobs=24/40 current_bucket=256  '
+        'job_tokens=198  jobs_in_bucket=3/8')
 
 
 def test_consume_worker_events_tracks_bucket_progress(tmp_path: Path):
@@ -297,12 +301,12 @@ def test_render_progress_snapshot_when_not_tty():
     render_progress([g0, g1], state, tty=False, out=buf)
     out = buf.getvalue()
     assert 'GPU 0 (A100)' in out
-    assert '1/40' in out
-    assert 'bucket=256' in out
-    assert 'tokens=198' in out
-    assert 'job=3/8' in out
+    assert 'jobs=1/40' in out
+    assert 'current_bucket=256' in out
+    assert 'job_tokens=198' in out
+    assert 'jobs_in_bucket=3/8' in out
     assert 'GPU 1 (L40S)' in out
-    assert '0/35' in out
+    assert 'jobs=0/35' in out
     assert '\033[' not in out
     render_progress([g0, g1], state, tty=False, out=buf)
     assert buf.getvalue().count('GPU 0 (A100)') == 2
@@ -329,7 +333,7 @@ def test_render_progress_rewrites_in_place_on_tty():
     text = buf.getvalue()
     assert '\033[1A' in text
     assert '\033[K' in text
-    assert '1/4' in text
+    assert 'jobs=1/4' in text
 
 
 def test_run_workers_progress_only_when_verbose(tmp_path, capsys, monkeypatch):
@@ -360,7 +364,7 @@ def test_run_workers_progress_only_when_verbose(tmp_path, capsys, monkeypatch):
     run_workers(loud, [g0], jobs=[], groups=[[]])
     out = capsys.readouterr().out
     assert 'GPU 0 (A100)' in out
-    assert '0/0' in out
+    assert 'jobs=0/0' in out
     assert 'workers finished' in out
 
 
@@ -455,3 +459,73 @@ def test_ledger_written(tmp_path: Path):
     write_ledger(cfg, jobs, rej)
     lines = (out / '_af3sched' / 'ledger.jsonl').read_text().strip().splitlines()
     assert len(lines) == 1
+
+
+def _search_cfg(tmp_path: Path, n_jobs: int, **kw):
+    inp, out = tmp_path / 'in', tmp_path / 'out'
+    for i in range(n_jobs):
+        _write_job(inp, f'j{i:02d}', (24, 40, 64, 96, 150, 220)[i % 6], seeds=(1, 2)[i % 2:])
+    cfg = Config(input_dir=inp, output_dir=out, bucket_mode='ladder', **kw)
+    return cfg, scan(cfg)[0]
+
+
+def _three_gpus():
+    fast = Bench((70_000, 67_000, 45_000, 45_000), 45_000.0, 47_000.0, False, 'h', 'k')
+    slow = Bench((110_000, 105_000, 74_000, 74_000), 74_000.0, 67_000.0, False, 'h', 'k')
+    return [
+        (Gpu(0, '0', 'u0', 'pci0', 'RTX 5090', 0), fast),
+        (Gpu(1, '1', 'u1', 'pci1', 'RTX 5080', 0), slow),
+        (Gpu(2, '2', 'u2', 'pci2', 'RTX 5090', 0), fast),
+    ]
+
+
+def test_search_policy_records_bound_and_is_deterministic(tmp_path: Path):
+    cfg, jobs = _search_cfg(tmp_path, 30)
+    benches = _three_gpus()
+    groups, meta = make_plan(cfg, jobs, benches)
+    assert meta['policy'] == 'search'
+    assert meta['split_mode'] == 'search'
+    info = meta['planner']
+    assert info['effort'] == 1 and info['stage'] == 'search'
+    assert 0 < info['lower_bound_us'] <= meta['makespan_us']
+    primary = [jid for gr in groups for g in gr if not g.shared for jid in g.job_ids]
+    assert sorted(primary) == sorted(j.job_id for j in jobs)
+    again, meta2 = make_plan(cfg, jobs, benches)
+    assert again == groups and meta2 == meta
+    json.dumps(meta, sort_keys=True)
+
+
+def test_search_policy_is_exact_for_few_jobs_and_efforts_validate(tmp_path: Path):
+    cfg, jobs = _search_cfg(tmp_path / 'a', 6)
+    _, meta = make_plan(cfg, jobs, _three_gpus())
+    assert meta['split_mode'] == 'exact' and meta['planner']['stage'] == 'exact'
+    cfg0, jobs0 = _search_cfg(tmp_path / 'b', 30, plan_effort=0)
+    _, meta0 = make_plan(cfg0, jobs0, _three_gpus())
+    assert meta0['planner']['effort'] == 0
+
+
+def test_roundrobin_policy_has_no_planner_block_and_search_is_not_worse(tmp_path: Path):
+    cfg, jobs = _search_cfg(tmp_path, 20, policy='roundrobin')
+    _, meta = make_plan(cfg, jobs, _three_gpus())
+    assert meta['policy'] == 'roundrobin' and 'planner' not in meta
+    assert meta['split_mode'] == 'roundrobin'
+    new_cfg, _ = _search_cfg(tmp_path / 'n', 20)
+    _, new_meta = make_plan(new_cfg, jobs, _three_gpus())
+    assert new_meta['makespan_us'] <= meta['makespan_us']
+
+
+def test_removed_contiguous_policy_is_rejected(tmp_path: Path):
+    cfg, jobs = _search_cfg(tmp_path, 6, policy='contiguous')
+    with pytest.raises(ValueError, match='contiguous'):
+        make_plan(cfg, jobs, _three_gpus())
+
+
+def test_report_for_search_policy_prints_bound_and_no_duplicate_shape_warning(
+        tmp_path: Path, capsys):
+    cfg, jobs = _search_cfg(tmp_path, 30)
+    benches = _three_gpus()
+    groups, meta = make_plan(cfg, jobs, benches)
+    report(groups, meta, [g for g, _ in benches], jobs)
+    out = capsys.readouterr().out
+    assert 'policy=search' in out and 'no plan can beat' in out
+    assert 'duplicated across GPUs' not in out

@@ -9,7 +9,7 @@ description = "AlphaFold 3 at full throughput"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "src/fullFold/hoists/THIRD_PARTY_NOTICES.md"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
@@ -32,7 +32,7 @@ where = ["src"]
 include = ["fullFold*"]
 
 [tool.setuptools.package-data]
-fullFold = ["data/*.csv"]
+fullFold = ["data/*.csv", "hoists/fingerprints.json", "hoists/THIRD_PARTY_NOTICES.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["src/tests"]

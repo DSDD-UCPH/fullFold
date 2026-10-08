@@ -293,9 +293,24 @@ def test_cache_path_splits_fast_and_off(tmp_path: Path):
     gpu = Gpu(0, '0', 'u', 'pci', 'A100', 0)
     off = cache_path(Config(cache_dir=tmp_path, mode='off'), gpu)
     fast = cache_path(Config(cache_dir=tmp_path, mode='fast'), gpu)
-    assert off != fast
+    default = cache_path(Config(cache_dir=tmp_path, mode='default'), gpu)
+    assert off != fast != default
     assert '|off|' in off.name
     assert '|fast|' in fast.name
+    assert '|default|' in default.name
+    assert '|h=none' in off.name
+
+
+def test_cache_path_splits_on_hoist_set(tmp_path: Path):
+    gpu = Gpu(0, '0', 'u', 'pci', 'A100', 0)
+    stock = cache_path(Config(cache_dir=tmp_path, mode='default', hoists=()), gpu)
+    hoisted = cache_path(
+        Config(cache_dir=tmp_path, mode='default',
+               hoists=('cond_share', 'atom_cond_hoist', 'diffusion_hoist')),
+        gpu)
+    assert stock != hoisted
+    assert '|h=none' in stock.name
+    assert '|h=cond_share+atom_cond_hoist+diffusion_hoist' in hoisted.name
 
 
 def test_fast_mode_does_not_load_off_cache(tmp_path: Path):

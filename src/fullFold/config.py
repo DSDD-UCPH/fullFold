@@ -9,6 +9,7 @@ import os
 import socket
 from pathlib import Path
 
+POLICIES = ('search', 'roundrobin')
 DEFAULT_BUCKETS = (
     128, 256, 384, 512, 768, 1024, 1280, 1536, 2048, 2560, 3072, 3584, 4096,
     4608, 5120,
@@ -43,19 +44,19 @@ class Config:
     verbose: bool = False
     prefetch: int = 1
     background_extract: bool = True
-    policy: str = 'contiguous'  # contiguous | roundrobin
+    policy: str = 'search'  # search | roundrobin
+    plan_effort: int = 1  # search budget: 0 seeds+descent, 1 default, 2 thorough
     bucket_mode: str = 'free'  # free | ladder
     reference: str = 'standard'  # standard | fast
     buckets: tuple[int, ...] = DEFAULT_BUCKETS
     bucket_margin: float = 0.05
     stale_lock_seconds: int = 900
     retry_failed: bool = False
-    exact_split_threshold: int = 512
     force_benchmark: bool = False
     bench_seed: int = 42
     cache_dir: Path = Path('~/.cache/fullFold/bench').expanduser()
     jax_compilation_cache_dir: Path | None = None
-    xla_mem_fraction: float = 0.97
+    xla_mem_fraction: float | None = None
     xla_preallocate: bool = True
     exact_tokens: bool = False
     template: Path | None = None
@@ -69,7 +70,8 @@ class Config:
     num_diffusion_samples: int = 5
     flash_attention: str = 'triton'
     json_path: Path | None = None
-    mode: str = 'off'  # off | fast (af3-faster kernels; off unless --mode fast)
+    mode: str = 'default'  # default | off | fast
+    hoists: tuple[str, ...] = ()
     model: str = 'alphafold3'
     buckets_explicit: bool = False
     num_seeds: int | None = None
@@ -163,15 +165,31 @@ def jax_cache_dir(
     return root / f'{host_id()}__{kind_part}'
 
 
+RESERVE_BYTES = 640 * 1024 * 1024
+FALLBACK_MEM_FRACTION = 0.95
+
+
+def mem_fraction(memory_bytes: int) -> float:
+    """Leave 640 MiB for CUDA context so small GPUs do not OOM at a high fraction."""
+    if memory_bytes <= RESERVE_BYTES * 2:
+        return FALLBACK_MEM_FRACTION
+    return round((memory_bytes - RESERVE_BYTES) / memory_bytes, 4)
+
+
 def worker_environ(
     cfg: Config, gpu_physical_id: str, *,
     pci_bus_id: str = '', device_kind: str = '',
+    memory_bytes: int = 0,
 ) -> dict[str, str]:
     """Env for a one-GPU worker/probe subprocess (parent never initialises JAX)."""
     env = os.environ.copy()
     env['CUDA_VISIBLE_DEVICES'] = str(gpu_physical_id)
     env['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
-    env['XLA_CLIENT_MEM_FRACTION'] = str(cfg.xla_mem_fraction)
+    frac = (
+        cfg.xla_mem_fraction if cfg.xla_mem_fraction is not None
+        else mem_fraction(memory_bytes)
+    )
+    env['XLA_CLIENT_MEM_FRACTION'] = str(frac)
     env['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true' if cfg.xla_preallocate else 'false'
     cache = jax_cache_dir(
         cfg, physical_id=gpu_physical_id, pci_bus_id=pci_bus_id,

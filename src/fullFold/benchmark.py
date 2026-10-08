@@ -131,17 +131,18 @@ def discover_gpus(cfg: Config, rows: list[dict] | None = None) -> list[Gpu]:
 
 def gpu_key(
     gpu: Gpu, jax_version: str = '', af3_version: str = '',
-    mode: str = 'off', model: str = 'alphafold3',
+    mode: str = 'off', model: str = 'alphafold3', hoists: str = 'none',
 ) -> str:
     return (
         f'{gpu.pci_bus_id}|{gpu.device_kind}|{jax_version}|{af3_version}'
-        f'|{mode}|{model}'
+        f'|{mode}|{model}|h={hoists}'
     )
 
 
 def cache_path(cfg: Config, gpu: Gpu, jax_version: str = '', af3_version: str = '') -> Path:
+    hoists = '+'.join(cfg.hoists) if cfg.hoists else 'none'
     return cfg.cache_dir / (
-        f'{host_id()}__{gpu_key(gpu, jax_version, af3_version, cfg.mode, cfg.model)}.json'
+        f'{host_id()}__{gpu_key(gpu, jax_version, af3_version, cfg.mode, cfg.model, hoists)}.json'
     )
 
 
@@ -214,7 +215,8 @@ def measure(gpu: Gpu, cfg: Config) -> Bench:
     """Spawn a per-GPU probe subprocess so the parent never initialises JAX."""
     import sys
     env = worker_environ(
-        cfg, gpu.physical_id, pci_bus_id=gpu.pci_bus_id, device_kind=gpu.device_kind)
+        cfg, gpu.physical_id, pci_bus_id=gpu.pci_bus_id,
+        device_kind=gpu.device_kind, memory_bytes=gpu.memory_bytes)
     cmd = [
         sys.executable, '-m', 'fullFold.worker', '--probe',
         '--gpu', str(gpu.physical_id),
@@ -239,8 +241,12 @@ def measure(gpu: Gpu, cfg: Config) -> Bench:
     s, r_ms, cont = summarise_timings(t)
     if cont:
         warnings.warn(f'contaminated benchmark on GPU {gpu.physical_id}: t={t}')
-    b = Bench(t_ms=tuple(t), s_ms=s, r_ms=r_ms, contaminated=cont,
-              host=host_id(), gpu_key=gpu_key(gpu, mode=cfg.mode, model=cfg.model))
+    hoists = '+'.join(cfg.hoists) if cfg.hoists else 'none'
+    b = Bench(
+        t_ms=tuple(t), s_ms=s, r_ms=r_ms, contaminated=cont,
+        host=host_id(),
+        gpu_key=gpu_key(gpu, mode=cfg.mode, model=cfg.model, hoists=hoists),
+    )
     save_bench(cache_path(cfg, gpu), b)
     return b
 

@@ -62,8 +62,8 @@ def apply_model_name(config, model_name: str) -> None:
 
 
 def install_fast_mode(cfg) -> None:
-    """Patch this process with af3-faster kernels. No-op when mode is off."""
-    if getattr(cfg, 'mode', 'off') != 'fast':
+    """Patch this process with af3-faster kernels. No-op unless mode is fast."""
+    if getattr(cfg, 'mode', 'default') != 'fast':
         return
     try:
         from af3_faster.install import apply_fast_env, install_fast
@@ -73,6 +73,41 @@ def install_fast_mode(cfg) -> None:
         ) from e
     apply_fast_env()
     install_fast()
+
+
+def install_hoists(cfg) -> list[str]:
+    """Install exact-math hoists for ``--mode default``. No-op otherwise."""
+    if getattr(cfg, 'mode', 'default') != 'default':
+        return []
+    from fullFold import af3args as _af3args
+    from fullFold.hoists import evaluate_hoists, install, notices
+    statuses = evaluate_hoists(af3_faster=_af3args.af3_faster_installed())
+    for line in notices(statuses):
+        print(line, flush=True)
+    names = [n for n in ('cond_share', 'atom_cond_hoist', 'diffusion_hoist')
+             if statuses[n].install]
+    installed: list[str] = []
+    try:
+        installed = install(names)
+        want_hl = bool(statuses.get('hoist_logits') and statuses['hoist_logits'].install)
+        if getattr(cfg, 'hoist_logits', None) is False:
+            want_hl = False
+        if want_hl:
+            from af3_faster.levers import hoist_logits
+            hoist_logits.install()
+            installed.append('hoist_logits')
+    except Exception as e:
+        print(f'fullFold: hoist install failed ({type(e).__name__}: {e}); '
+              'using stock AlphaFold 3.', flush=True)
+        import importlib
+        for mod_name in ('diffusion_hoist', 'atom_cond_hoist', 'cond_share'):
+            try:
+                importlib.import_module(f'fullFold.hoists.{mod_name}').uninstall()
+            except Exception:
+                pass
+        return []
+    print(f'fullFold: hoists={installed or ["none"]}', flush=True)
+    return installed
 
 
 def _family_marks(model_name: str) -> tuple[str, ...]:

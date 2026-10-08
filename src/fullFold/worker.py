@@ -445,9 +445,11 @@ def _infer(*_):
 
 def _bind_runner(cfg: Config):
     from fullFold.runner import (
-        ModelRunner, install_fast_mode, make_model_config, resolve_model_dir,
+        ModelRunner, install_fast_mode, install_hoists, make_model_config,
+        resolve_model_dir,
     )
     install_fast_mode(cfg)
+    install_hoists(cfg)
     import jax
     cache = os.environ.get('AF3SCHED_JAX_CACHE') or str(jax_cache_dir(
         cfg, physical_id=os.environ.get('CUDA_VISIBLE_DEVICES', '0')))
@@ -553,7 +555,7 @@ def worker_main(argv: list[str] | None = None) -> int:
     p.add_argument('--probe', action='store_true')
     p.add_argument('--gpu', default='')
     p.add_argument('--flash-attention', default='')
-    p.add_argument('--mode', default='off')
+    p.add_argument('--mode', default='default')
     p.add_argument('--model', default='alphafold3')
     p.add_argument('--num-recycles', type=int, default=10)
     p.add_argument('--num-diffusion-samples', type=int, default=5)

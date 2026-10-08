@@ -22,7 +22,7 @@ from pathlib import Path
 INF = 10**18
 Work = tuple[int, int, str]  # tokens, n_seeds, job_id
 Gpu = tuple[int, int]        # compile_us_1024, infer_us_1024
-FREE_ALIGN = 8  # --bucket-mode=free extras above CSV_MAX round up to this
+FREE_ALIGN = 64  # shapes above CSV_MAX (any bucket mode) round up to a multiple of this
 KERNEL_TILE = 64  # FlashPairformer fast mode wants N a multiple of this
 KERNEL_TILE_MAX = 5120
 SHAPE_REF = 1024
@@ -138,12 +138,11 @@ def _ceil_multiple(n: int, k: int = FREE_ALIGN) -> int:
     return ((n + k - 1) // k) * k
 
 
-def _cover(tokens: int, mode: str, ref: TimingRef = STANDARD) -> int:
+def _cover(tokens: int, ref: TimingRef = STANDARD) -> int:
+    """Smallest candidate shape for a job: the next CSV bucket, above the CSV a multiple of 64."""
     if tokens <= ref.csv_max:
         return _snap_csv(tokens, ref)
-    if mode == 'free':
-        return _ceil_multiple(tokens)
-    return tokens
+    return _ceil_multiple(tokens)
 
 
 def listed_shapes(work: list[Work], buckets: tuple[int, ...] | list[int]) -> list[int]:
@@ -174,7 +173,7 @@ def kernel_tile_shapes(
 ) -> list[int]:
     """Compile shapes for af3-faster fast mode: multiples of ``tile`` through ``hi``.
 
-    Above ``hi``, cover with ``tile`` instead of the free-mode multiple of 8.
+    Above ``hi``, cover with ``tile``, the same multiple of 64 that every mode uses above the CSV.
     Cost lookups still use the active timing reference; this list is only the
     shapes that are compiled.
     """
@@ -215,7 +214,7 @@ def candidate_shapes(
         else:
             out.update(s for s in ref.buckets if lo <= s <= hi)
     for t in over:
-        out.add(_cover(t, mode, ref))
+        out.add(_cover(t, ref))
     return sorted(out)
 
 
@@ -225,7 +224,7 @@ def _shape_for(
     for s in shapes:
         if s >= tokens:
             return s
-    return _cover(tokens, 'free', ref) if tokens <= ref.csv_max else tokens
+    return _cover(tokens, ref) if tokens <= ref.csv_max else tokens
 
 
 def _hist(work: list[Work], shapes: list[int]) -> list[int]:
@@ -289,29 +288,6 @@ def plan_gpu(
     return best, _assign(work, compiled)
 
 
-def _split_points(
-    work: list[Work], shapes: list[int], n_gpus: int, threshold: int,
-    ref: TimingRef = STANDARD,
-) -> list[int]:
-    n = len(work)
-    if n <= threshold:
-        return list(range(n + 1))
-    pts = {0, n}
-    idx = 0
-    while idx < n:
-        b = _shape_for(work[idx][0], shapes, ref)
-        j = idx
-        while j < n and _shape_for(work[j][0], shapes, ref) == b:
-            j += 1
-        pts.add(idx)
-        span = j - idx
-        if span > 1:
-            for t in range(1, n_gpus):
-                pts.add(idx + (span * t) // n_gpus)
-        idx = j
-    return sorted(pts)
-
-
 def job_floor_us(
     work: list[Work], gpus: list[Gpu], shapes: list[int],
     ref: TimingRef = STANDARD,
@@ -327,134 +303,6 @@ def job_floor_us(
         if c > best:
             best, best_id = c, w[2]
     return best, best_id
-
-
-def _plan_slice(
-    work: list[Work], gpu: Gpu, shapes: list[int], ref: TimingRef = STANDARD,
-) -> tuple[int, list[Group]]:
-    if not work:
-        return 0, []
-    return plan_gpu(work, gpu, shapes, ref)
-
-
-def _best_split(
-    work: list[Work], gpu_l: Gpu, gpu_r: Gpu, shapes: list[int],
-    left: int, right: int, ref: TimingRef = STANDARD,
-) -> int:
-    """Index in ``[left, right]`` minimising max(left GPU cost, right GPU cost)."""
-    if left >= right:
-        return left
-
-    def score(i: int) -> tuple[int, int]:
-        c_l, _ = _plan_slice(work[left:i], gpu_l, shapes, ref)
-        c_r, _ = _plan_slice(work[i:right], gpu_r, shapes, ref)
-        return max(c_l, c_r), i
-
-    lo, hi = left, right
-    while lo < hi:
-        mid = (lo + hi) // 2
-        c_l, _ = _plan_slice(work[left:mid], gpu_l, shapes, ref)
-        c_r, _ = _plan_slice(work[mid:right], gpu_r, shapes, ref)
-        if c_l < c_r:
-            lo = mid + 1
-        else:
-            hi = mid
-    i = lo
-    improved = True
-    while improved:
-        improved = False
-        for j in (i - 1, i + 1):
-            if left <= j <= right and score(j) < score(i):
-                i = j
-                improved = True
-                break
-    return i
-
-
-def rebalance_contiguous(
-    work: list[Work],
-    gpus: list[Gpu],
-    shapes: list[int],
-    assignment: list[list[Group]],
-    ref: TimingRef = STANDARD,
-) -> tuple[int, list[list[Group]]] | None:
-    """Move contiguous split points so predicted GPU times match as closely as possible."""
-    G = len(gpus)
-    if G < 2 or not work:
-        return None
-    bounds = [0]
-    for gr in assignment:
-        bounds.append(bounds[-1] + sum(len(g.job_ids) for g in gr if not g.shared))
-    if bounds[-1] != len(work):
-        return None
-    for _ in range(G):
-        for b in range(1, G):
-            bounds[b] = _best_split(
-                work, gpus[b - 1], gpus[b], shapes, bounds[b - 1], bounds[b + 1],
-                ref)
-    out: list[list[Group]] = []
-    loads: list[int] = []
-    for g in range(G):
-        cost, groups = _plan_slice(
-            work[bounds[g]:bounds[g + 1]], gpus[g], shapes, ref)
-        out.append(groups)
-        loads.append(cost)
-    return max(loads) if loads else 0, out
-
-
-def plan_multi_gpu(
-    work: list[Work],
-    gpus: list[Gpu],
-    shapes: list[int],
-    exact_split_threshold: int = 512,
-    ref: TimingRef = STANDARD,
-) -> tuple[int, int, str, list[list[Group]]]:
-    """Returns (makespan_us, floor_us, floor_job_id, per_gpu_groups)."""
-    G = len(gpus)
-    floor, floor_id = job_floor_us(work, gpus, shapes, ref)
-    if not work:
-        return 0, 0, '', [[] for _ in gpus]
-    if G == 0:
-        return INF, floor, floor_id, []
-    if G == 1:
-        cost, groups = plan_gpu(work, gpus[0], shapes, ref)
-        return cost, floor, floor_id, [groups]
-    points = _split_points(work, shapes, G, exact_split_threshold, ref)
-    P = len(points)
-    costs: list[list[list[int]]] = []
-    groups_tbl: list[list[list[list[Group] | None]]] = []
-    for g in range(G):
-        row_c = [[INF] * P for _ in range(P)]
-        row_g: list[list[list[Group] | None]] = [[None] * P for _ in range(P)]
-        for i in range(P):
-            for j in range(i + 1, P):
-                c, gr = plan_gpu(work[points[i]:points[j]], gpus[g], shapes, ref)
-                row_c[i][j], row_g[i][j] = c, gr
-        costs.append(row_c)
-        groups_tbl.append(row_g)
-    dp = [[INF] * P for _ in range(G + 1)]
-    split = [[0] * P for _ in range(G + 1)]
-    dp[0][0] = 0
-    for k in range(1, G + 1):
-        for j in range(P):
-            for i in range(j + 1):
-                gpu_cost = 0 if i == j else costs[k - 1][i][j]
-                val = max(dp[k - 1][i], gpu_cost)
-                if val < dp[k][j]:
-                    dp[k][j] = val
-                    split[k][j] = i
-    assignment: list[list[Group]] = [[] for _ in range(G)]
-    j = P - 1
-    for k in range(G, 0, -1):
-        i = split[k][j]
-        if i < j:
-            assignment[k - 1] = groups_tbl[k - 1][i][j] or []
-        j = i
-    makespan = dp[G][P - 1]
-    refined = rebalance_contiguous(work, gpus, shapes, assignment, ref)
-    if refined is not None:
-        makespan, assignment = refined
-    return makespan, floor, floor_id, assignment
 
 
 def groups_cost_us(

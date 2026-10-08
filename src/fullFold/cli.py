@@ -9,7 +9,7 @@ from pathlib import Path
 from fullFold import af3args
 from fullFold.af3args import AbslBool, add_run_alphafold_flags
 from fullFold.banner import print_banner
-from fullFold.config import DEFAULT_BUCKETS, Config, config_from_dict
+from fullFold.config import DEFAULT_BUCKETS, POLICIES, Config, config_from_dict
 
 
 def _buckets(s: str) -> tuple[int, ...]:
@@ -29,7 +29,10 @@ def _add_sched(p: argparse.ArgumentParser, *, colabfold: bool) -> None:
                    const=0, default=1)
     p.add_argument('--no-background-extract', dest='background_extract',
                    action='store_false')
-    p.add_argument('--policy', choices=('contiguous', 'roundrobin'), default='contiguous')
+    p.add_argument('--policy', choices=POLICIES,
+                   default='search')
+    p.add_argument('--plan-effort', '--plan_effort', type=int, choices=(0, 1, 2),
+                   default=1, help='Search budget of --policy search (0 fastest, 2 thorough)')
     p.add_argument('--bucket-mode', choices=('ladder', 'free'), default='free')
     p.add_argument(
         '--reference', choices=('standard', 'fast'), default='standard',
@@ -40,7 +43,6 @@ def _add_sched(p: argparse.ArgumentParser, *, colabfold: bool) -> None:
     p.add_argument('--bucket-margin', type=float, default=0.05)
     p.add_argument('--stale-lock-seconds', type=int, default=900)
     p.add_argument('--retry-failed', action='store_true')
-    p.add_argument('--exact-split-threshold', type=int, default=512)
     p.add_argument('--force-benchmark', action='store_true')
     p.add_argument('--bench-seed', type=int, default=42)
     p.add_argument('--cache-dir', type=Path, default=Config.cache_dir)
@@ -48,7 +50,7 @@ def _add_sched(p: argparse.ArgumentParser, *, colabfold: bool) -> None:
     p.add_argument('--dry-run', action='store_true')
     p.add_argument('--jax-compilation-cache-dir', '--jax_compilation_cache_dir',
                    type=Path, default=None)
-    p.add_argument('--xla-mem-fraction', type=float, default=0.97)
+    p.add_argument('--xla-mem-fraction', type=float, default=None)
     p.add_argument('--save-embeddings', '--save_embeddings',
                    action=AbslBool, default=False)
     p.add_argument('--save-distogram', '--save_distogram',
@@ -106,10 +108,32 @@ def main(argv: list[str] | None = None) -> int:
         if err:
             print(err, file=sys.stderr)
             return 2
+        if args.mode is None:
+            if af3args.af3_faster_installed():
+                args.mode = 'fast'
+                print(
+                    'fullFold: af3-faster detected, using --mode fast '
+                    '(pass --mode default for exact-math hoists only, '
+                    '--mode off for stock AF3).',
+                    file=sys.stderr,
+                )
+            else:
+                args.mode = 'default'
         if args.mode == 'fast' and not af3args.af3_faster_installed():
             print('fullFold: --mode fast requires the af3-faster package.',
                   file=sys.stderr)
             return 2
+        from fullFold.hoists import evaluate_hoists, notices
+        statuses = evaluate_hoists(
+            mode=args.mode, af3_faster=af3args.af3_faster_installed())
+        args.hoists = tuple(
+            n for n in (
+                'cond_share', 'atom_cond_hoist', 'diffusion_hoist',
+                'hoist_logits',
+            ) if statuses[n].active
+        )
+        for line in notices(statuses):
+            print(line, file=sys.stderr)
         if args.mode == 'fast' and not af3args.flag_set(argv, 'reference'):
             args.reference = 'fast'
         args.buckets_explicit = af3args.flag_set(argv, 'buckets')

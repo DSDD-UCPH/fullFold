@@ -29,7 +29,7 @@ def _run(monkeypatch, argv):
     return rc, seen
 
 
-def test_hyphen_flags_and_default_mode_stay_off(monkeypatch, tmp_path: Path):
+def test_omitted_mode_is_fast_when_af3_faster(monkeypatch, tmp_path: Path, capsys):
     _patch_tree(monkeypatch, colabfold=False, faster=True)
     inp, out = tmp_path / 'in', tmp_path / 'out'
     rc, seen = _run(monkeypatch, [
@@ -37,10 +37,35 @@ def test_hyphen_flags_and_default_mode_stay_off(monkeypatch, tmp_path: Path):
     ])
     assert rc == 0
     cfg = seen['cfg']
-    assert cfg.mode == 'off'
-    assert cfg.reference == 'standard'
+    assert cfg.mode == 'fast'
+    assert cfg.reference == 'fast'
     assert cfg.model == 'alphafold3'
     assert cfg.buckets_explicit is False
+    assert 'using --mode fast' in capsys.readouterr().err
+
+
+def test_omitted_mode_is_default_without_af3_faster(monkeypatch, tmp_path: Path):
+    _patch_tree(monkeypatch, colabfold=False, faster=False)
+    inp, out = tmp_path / 'in', tmp_path / 'out'
+    rc, seen = _run(monkeypatch, [
+        'run', '--input-dir', str(inp), '--output-dir', str(out),
+    ])
+    assert rc == 0
+    cfg = seen['cfg']
+    assert cfg.mode == 'default'
+    assert cfg.reference == 'standard'
+
+
+def test_explicit_default_mode(monkeypatch, tmp_path: Path):
+    _patch_tree(monkeypatch, colabfold=False, faster=True)
+    inp, out = tmp_path / 'in', tmp_path / 'out'
+    rc, seen = _run(monkeypatch, [
+        'run', '--input-dir', str(inp), '--output-dir', str(out),
+        '--mode', 'default',
+    ])
+    assert rc == 0
+    assert seen['cfg'].mode == 'default'
+    assert seen['cfg'].reference == 'standard'
 
 
 def test_underscore_aliases_and_absl_false(monkeypatch, tmp_path: Path):
@@ -248,6 +273,9 @@ def test_fast_worker_env_sets_levers(monkeypatch, tmp_path: Path):
     off = worker_environ(
         Config(mode='off', cache_dir=tmp_path), '0', device_kind='A100')
     assert 'AF3_FLASHPAIRFORMER' not in off
+    default = worker_environ(
+        Config(mode='default', cache_dir=tmp_path), '0', device_kind='A100')
+    assert 'AF3_FLASHPAIRFORMER' not in default
     monkeypatch.setenv('XLA_FLAGS', '--xla_dump_to=/tmp')
     kept = worker_environ(
         Config(mode='fast', cache_dir=tmp_path), '0', device_kind='A100')

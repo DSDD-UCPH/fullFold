@@ -1,13 +1,15 @@
-"""Scheduler DP vs a local brute-force reference. Nothing imported from scheduler/."""
+"""Scheduler DP and planner vs a local brute-force reference. Nothing imported from scheduler/."""
 
 from __future__ import annotations
 
+import itertools
 import random
 
+from fullFold.planner import plan_multi_gpu_search as plan_multi_gpu
 from fullFold.scheduling import (
     CSV_BUCKETS, CSV_MAX, FAST, INF, STANDARD, Group, candidate_shapes,
     compilation_modifier, compilation_us, groups_cost_us, inference_modifier,
-    inference_us, plan_gpu, plan_multi_gpu, plan_round_robin, reference_for,
+    inference_us, plan_gpu, plan_round_robin, reference_for,
     share_tails, shape_factor,
 )
 
@@ -43,26 +45,16 @@ def brute_gpu(work, gpu, shapes):
     return best
 
 
-def compositions(n, g):
-    if g == 1:
-        yield (n,)
-        return
-    for i in range(n + 1):
-        for rest in compositions(n - i, g - 1):
-            yield (i,) + rest
-
-
 def brute_multi(work, gpus, shapes):
+    """Absolute optimum: every assignment of jobs to GPUs, each GPU planned by brute force."""
     n, G = len(work), len(gpus)
     if n == 0:
         return 0
     best = INF
-    for parts in compositions(n, G):
-        idx, loads = 0, []
-        for g, p in enumerate(parts):
-            block = work[idx:idx + p]
-            idx += p
-            loads.append(0 if not block else brute_gpu(block, gpus[g], shapes))
+    for assign in itertools.product(range(G), repeat=n):
+        loads = [
+            brute_gpu([w for w, a in zip(work, assign) if a == g], gpus[g], shapes)
+            for g in range(G)]
         best = min(best, max(loads))
     return best
 
@@ -171,7 +163,7 @@ def test_fast_reference_changes_compile_choice():
     _, fast = plan_gpu(work, gpu, shapes, FAST)
     assert [g.shape for g in standard] == [128, 256]
     assert [g.shape for g in fast] == [256]
-    cost, _, _, _ = plan_multi_gpu(work, [gpu], shapes, ref=FAST)
+    cost, _, _, _ = plan_multi_gpu(work, [gpu], shapes, FAST)
     assert cost == compilation_us(55_000, 256, FAST) + 2 * inference_us(
         1_000_000, 256, FAST)
 
@@ -195,8 +187,9 @@ def test_candidates_at_or_below_csv_max_are_csv_only():
     assert 17 not in free and 17 not in ladder
     assert 19 in free
     assert 50 in ladder
-    assert 6000 in free
-    assert 6000 in ladder
+    assert 6016 in free and 6016 in ladder  # above the CSV: next multiple of 64
+    assert 6000 not in free and 6000 not in ladder
+    assert all(s % 64 == 0 for s in free + ladder if s > CSV_MAX)
 
 
 def test_plan_gpu_compile_follows_csv_modifiers():
@@ -270,15 +263,6 @@ def test_heterogeneous_65_percent_faster_gets_more_than_half():
     assert n0 >= 55
 
 
-def test_contiguous_shape_ranges_mostly_disjoint():
-    work = [_w(128 * (i + 1), 1, f'j{i}') for i in range(20)]
-    shapes = [128 * (i + 1) for i in range(20)]
-    _, _, _, groups = plan_multi_gpu(work, [(0, 1_000_000), (0, 1_000_000)], shapes)
-    s0 = {g.shape for g in groups[0]}
-    s1 = {g.shape for g in groups[1]}
-    assert s0 and s1
-    assert len(s0 & s1) <= 1
-
 
 def test_brute_small_random():
     rng = random.Random(0)
@@ -297,14 +281,6 @@ def test_brute_small_random():
         ms, _, _, _ = plan_multi_gpu(work, gpus, shapes)
         assert ms == brute_multi(work, gpus, shapes)
 
-
-def test_coarsened_agrees_near_threshold():
-    work = [_w(128, 1, f'j{i}') for i in range(6)]
-    gpus = [(2, 1_000_000), (2, 1_000_000)]
-    shapes = [128, 256]
-    a = plan_multi_gpu(work, gpus, shapes, exact_split_threshold=1000)[0]
-    b = plan_multi_gpu(work, gpus, shapes, exact_split_threshold=3)[0]
-    assert a == b
 
 
 def test_determinism_shuffle():
@@ -339,13 +315,12 @@ def test_cubic_only_above_csv_max():
     assert compilation_us(1_000_000, 6000) == compilation_us(1_000_000, CSV_MAX)
 
 
-def test_coarsened_heterogeneous_near_equal_makespan():
+def test_large_two_shape_instance_is_balanced_across_heterogeneous_gpus():
     work = [_w(128, 1, f's{i}') for i in range(400)]
     work += [_w(256, 1, f'l{i}') for i in range(400)]
     gpus = [(0, 750_000), (0, 1_320_000)]
     shapes = [128, 256]
-    ms, _, _, groups = plan_multi_gpu(
-        work, gpus, shapes, exact_split_threshold=50)
+    ms, _, _, groups = plan_multi_gpu(work, gpus, shapes)
     c0 = groups_cost_us(groups[0], work, gpus[0])
     c1 = groups_cost_us(groups[1], work, gpus[1])
     assert ms == max(c0, c1)
