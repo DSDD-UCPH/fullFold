@@ -4,7 +4,7 @@
 
 On multi-GPU systems, fullFold orchestrates prediction jobs across all available GPUs, including heterogeneous systems with GPUs of different performance. It dynamically distributes workloads while reducing unnecessary scheduling overhead and fully preserving the underlying AF3 inference implementation. In our benchmarks, fullFold has shown near-linear scaling with both the number and performance of available GPUs**, allowing throughput to scale efficiently across multi-GPU systems.
 
-fullFold does not edit the AlphaFold 3 source tree. `--mode default` (used when `--mode` is omitted and af3-faster is not installed) monkeypatches exact-math diffusion hoists into the running process; coordinates should match stock within ordinary GPU noise but are not bitwise identical. `--mode off` is stock AlphaFold 3. `--mode fast` is the default when af3-faster is installed. It operates on fully prepared AlphaFold 3 inputs and focuses exclusively on the inference stage, not MSA generation or other parts of the data pipeline.
+fullFold does not edit the AlphaFold 3 source tree. `--mode default` (used when `--mode` is omitted and af3-faster is not installed) monkeypatches exact-math diffusion hoists into the running process (see below for more information); coordinates should match stock within ordinary GPU noise but are not bitwise identical per se. `--mode off` is stock AlphaFold 3. `--mode fast` is the default when af3-faster is installed. It operates on fully prepared AlphaFold 3 inputs and focuses exclusively on the inference stage, not MSA generation or other parts of the data pipeline.
 
 Inputs must therefore already contain the required MSA and template fields, including `""` where appropriate for MSA-free predictions. **fullFold does not run or replace the AlphaFold 3 data pipeline**; feature generation using the standard AlphaFold 3 pipeline must be completed before running fullFold.
 
@@ -200,8 +200,8 @@ A preprint or publication describing **fullFold** is not yet available. In the m
 
 > Verhellen, J. & Kooistra, A. J. **fullFold: Unlocking the Full Speed of AlphaFold 3.** Version `<version>`. GitHub: `https://github.com/DSDD-UCPH/fullFold`.
 
-For reproducibility, please replace `<version>` with the fullFold release used in your analysis (for example, `v0.1.1`). If you used an unreleased version, please cite the corresponding Git commit hash in addition to the repository URL.
+For reproducibility, please replace `<version>` with the fullFold release used in your analysis (for example, `v0.1.2`). If you used an unreleased version, please cite the corresponding Git commit hash in addition to the repository URL.
 
 Once a preprint or publication becomes available, the recommended citation will be updated here.
 
-The default-mode hoists are modified copies of Anthropic's AlphaFold 3 JAX kit as shipped in [af3-faster](https://github.com/DSDD-UCPH/af3-faster), reproducing DeepMind AlphaFold 3 v3.0.4 diffusion code. The hoist design originates in [sokrypton/alphafold3](https://github.com/sokrypton/alphafold3) (ColabFold ≥ 3.1.7). See `fullFold/hoists/THIRD_PARTY_NOTICES.md`.
+The default-mode hoists are modified copies of Anthropic's AlphaFold 3 JAX kit as shipped in [af3-faster](https://github.com/DSDD-UCPH/af3-faster), reproducing DeepMind AlphaFold 3 v3.0.4 diffusion code. The hoist design originates in [sokrypton/alphafold3](https://github.com/sokrypton/alphafold3) (Sergey Ovchinnikov's modified alphafold3  ≥ 3.1.7). See `fullFold/hoists/THIRD_PARTY_NOTICES.md`.
