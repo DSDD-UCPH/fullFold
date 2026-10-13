@@ -13,12 +13,13 @@ import queue
 import sys
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 from fullFold.config import Config, config_from_dict, jax_cache_dir
-from fullFold.jobs import Job, end_claim, try_begin_claim
+from fullFold.jobs import Job, end_claim, release_claim, try_begin_claim
 
 _LOG_LOCK = threading.Lock()
 
@@ -36,6 +37,13 @@ class _Bg:
             return
         if self._fut is not None:
             self._fut.result()
+        self._fut = self._ex.submit(fn)
+
+    def post(self, fn) -> None:
+        """Queue ``fn`` behind the in-flight task without waiting for it."""
+        if self._ex is None:
+            fn()
+            return
         self._fut = self._ex.submit(fn)
 
     def drain(self) -> None:
@@ -124,10 +132,35 @@ def featurise_one(fold_input, seed: int, buckets: list[int], ccd=None, cfg=None)
     return featurise_fold(fold_input, seed, buckets, ccd=ccd, cfg=cfg)
 
 
-def _default_feat(job, seed, shape, cfg=None):
+# Parsed inputs and their CCD, per job. A job featurises once per seed, and an
+# input with a large MSA is expensive to parse, so parse once. Two entries cover
+# the running job and the one being prepared behind it.
+_FOLDS: OrderedDict = OrderedDict()
+_FOLDS_LOCK = threading.Lock()
+_FOLDS_KEEP = 2
+
+
+def _load_fold(job: Job):
     from alphafold3.common import folding_input
+    from fullFold.runner import load_ccd
+    key = (str(job.path), job.sha256)
+    with _FOLDS_LOCK:
+        hit = _FOLDS.get(key)
+        if hit is not None:
+            _FOLDS.move_to_end(key)
+            return hit
     fold = folding_input.Input.from_json(job.path.read_text(), job.path)
-    return featurise_one(fold, seed, [shape], cfg=cfg)
+    hit = (fold, load_ccd(fold))
+    with _FOLDS_LOCK:
+        hit = _FOLDS.setdefault(key, hit)
+        while len(_FOLDS) > _FOLDS_KEEP:
+            _FOLDS.popitem(last=False)
+    return hit
+
+
+def _default_feat(job, seed, shape, cfg=None):
+    fold, ccd = _load_fold(job)
+    return featurise_one(fold, seed, [shape], ccd=ccd, cfg=cfg)
 
 
 def run_pipeline(items, cfg: Config, *, featurise_fn=None, infer_fn=None,
@@ -155,6 +188,7 @@ def run_pipeline(items, cfg: Config, *, featurise_fn=None, infer_fn=None,
 
     def fail(st, job, err):
         st['failed'] = True
+        st['error'] = str(err)
         stats['jobs_fail'] += 1
         if log_fp:
             log_event(log_fp, event='job_failed', job=job.job_id, error=str(err))
@@ -282,7 +316,13 @@ def run_pipeline(items, cfg: Config, *, featurise_fn=None, infer_fn=None,
 def run_jobs(chunks, cfg: Config, *, featurise_fn=None, infer_fn=None,
              extract_fn=None, write_seed_fn=None, write_final_fn=None,
              log_fp=None, live=None, setup_fn=None) -> dict:
-    """chunks: (job, shape). Prefetch>0 prepares job B while job A infers."""
+    """chunks: (job, shape). Prefetch>0 prepares job B while job A infers.
+
+    A job's ``done.json`` / ``failed.json`` is written as soon as its last
+    seed has been extracted and written, not at the end of the bucket: the
+    marker is queued on the extract thread right behind the job's last write,
+    so an interrupted run loses at most the job in flight.
+    """
     if featurise_fn is None:
         def featurise_fn(job, seed, shape, _cfg=cfg):
             return _default_feat(job, seed, shape, cfg=_cfg)
@@ -292,7 +332,7 @@ def run_jobs(chunks, cfg: Config, *, featurise_fn=None, infer_fn=None,
     chunks = list(chunks)
     bg = _Bg(bool(cfg.background_extract))
     state: dict[str, Any] = {}
-    pending: list[tuple[Job, dict]] = []
+    held: dict[str, Job] = {}  # claimed by this call and not yet settled
     pipe = dict(
         featurise_fn=featurise_fn, infer_fn=infer_fn, extract_fn=extract_fn,
         write_seed_fn=write_seed_fn, write_final_fn=write_final_fn,
@@ -301,41 +341,37 @@ def run_jobs(chunks, cfg: Config, *, featurise_fn=None, infer_fn=None,
     def _items(job, shape):
         return [(job, int(s), shape) for s in job.seeds]
 
-    def retire() -> None:
-        bg.drain()
-        while pending:
-            job, extra = pending.pop(0)
-            st = state.pop(job.job_id, {})
+    def claim_job(job):
+        extra, skip = try_begin_claim(job, cfg)
+        if extra is not None:
+            held[job.job_id] = job
+        return extra, skip
+
+    def settle(job, extra, error=None) -> None:
+        """Write the job's marker from its final state (or from ``error``)."""
+        st = state.pop(job.job_id, {})
+        if error is None:
             if st.get('failed'):
-                err: BaseException | None = RuntimeError('job failed')
+                error = RuntimeError(st.get('error') or 'job failed')
             elif int(st.get('seeds_done') or 0) != job.n_seeds:
-                err = RuntimeError('job incomplete')
-            else:
-                err = None
-            end_claim(job, cfg, extra, error=err)
+                error = RuntimeError('job incomplete')
+        held.pop(job.job_id, None)
+        try:
+            end_claim(job, cfg, extra, error=error)
+        except Exception as e:  # e.g. disk full: do not take the worker down
+            stats['jobs_fail'] += 1
+            if log_fp:
+                log_event(log_fp, event='job_failed', job=job.job_id,
+                          error=f'could not write markers: {e}')
 
-    def _run(job, shape, primed=None) -> BaseException | None:
-        if cfg.background_extract:
-            run_pipeline(_items(job, shape), cfg, primed=primed, **pipe)
-            return None
-        fail0, ok0 = stats['jobs_fail'], stats['jobs_ok']
+    def _run(job, shape, extra, primed=None) -> None:
         run_pipeline(_items(job, shape), cfg, primed=primed, **pipe)
-        if stats['jobs_fail'] > fail0:
-            return RuntimeError('job failed')
-        if stats['jobs_ok'] <= ok0:
-            return RuntimeError('job incomplete')
-        return None
-
-    def _done(job, extra, err):
-        if cfg.background_extract:
-            pending.append((job, extra))
-        else:
-            end_claim(job, cfg, extra, error=err)
+        bg.post(lambda: settle(job, extra))
 
     def _one(job, shape, primed=None):
         extra = None
         try:
-            extra, skip = try_begin_claim(job, cfg)
+            extra, skip = claim_job(job)
             if extra is None:
                 if log_fp:
                     log_event(log_fp, event='job_skip', job=job.job_id,
@@ -345,11 +381,11 @@ def run_jobs(chunks, cfg: Config, *, featurise_fn=None, infer_fn=None,
                 log_event(log_fp, event='job_prep', job=job.job_id, shape=shape)
             if setup_fn:
                 setup_fn(job)
-            _done(job, extra, _run(job, shape, primed=primed))
+            _run(job, shape, extra, primed=primed)
         except Exception as e:
             bg.drain()
             if extra is not None:
-                end_claim(job, cfg, extra, error=e)
+                settle(job, extra, error=e)
             elif log_fp:
                 log_event(log_fp, event='job_failed', job=job.job_id, error=str(e))
             stats['jobs_fail'] += 1
@@ -358,13 +394,14 @@ def run_jobs(chunks, cfg: Config, *, featurise_fn=None, infer_fn=None,
         if max(int(cfg.prefetch), 0) == 0:
             for job, shape in chunks:
                 if shape not in seen:
-                    retire()
+                    bg.drain()
                 _one(job, shape)
             stats['shapes'] = sorted(seen)
             return stats
 
         ready: queue.Queue = queue.Queue(maxsize=1)
         start_gate: queue.Queue = queue.Queue()
+        stop = threading.Event()
 
         def prepare():
             try:
@@ -372,8 +409,10 @@ def run_jobs(chunks, cfg: Config, *, featurise_fn=None, infer_fn=None,
                     extra = None
                     if i:
                         start_gate.get()
+                        if stop.is_set():
+                            break
                     try:
-                        extra, skip = try_begin_claim(job, cfg)
+                        extra, skip = claim_job(job)
                         if extra is None:
                             if log_fp:
                                 log_event(log_fp, event='job_skip',
@@ -394,7 +433,7 @@ def run_jobs(chunks, cfg: Config, *, featurise_fn=None, infer_fn=None,
                         ready.put(('ready', job, shape, extra, primed))
                     except Exception as e:
                         if extra is not None:
-                            end_claim(job, cfg, extra, error=e)
+                            settle(job, extra, error=e)
                         if log_fp:
                             log_event(log_fp, event='job_failed', job=job.job_id,
                                       error=str(e))
@@ -415,28 +454,41 @@ def run_jobs(chunks, cfg: Config, *, featurise_fn=None, infer_fn=None,
                 if kind != 'ready':
                     continue
                 if shape not in seen:
-                    retire()
+                    bg.drain()
                 try:
-                    _done(job, extra, _run(job, shape, primed=primed))
+                    _run(job, shape, extra, primed=primed)
                 except Exception as e:
                     bg.drain()
-                    end_claim(job, cfg, extra, error=e)
+                    settle(job, extra, error=e)
                     stats['jobs_fail'] += 1
-                    while True:
+                    while True:  # let the preparer finish; its claims are released below
                         nxt = ready.get()
                         if nxt is None:
                             break
                         start_gate.put(True)
-                        if nxt[0] == 'ready':
-                            end_claim(nxt[1], cfg, nxt[3], error=e)
                     raise
         finally:
-            th.join(timeout=5)
+            # Unblock the preparer (waiting on the gate, or on a full queue) so an
+            # interrupt does not sit in a join; unfinished claims are released below.
+            stop.set()
+            start_gate.put(True)
+            deadline = time.time() + 5
+            while th.is_alive() and time.time() < deadline:
+                try:
+                    ready.get(timeout=0.05)
+                except queue.Empty:
+                    pass
         stats['shapes'] = sorted(seen)
         return stats
     finally:
-        retire()
-        bg.close()
+        try:
+            bg.drain()
+        finally:
+            bg.close()
+            # Whatever is still held never reached a verdict (interrupted, or
+            # prepared but never run): hand it back instead of marking it failed.
+            for job in list(held.values()):
+                release_claim(job, cfg)
 
 
 def _infer(*_):
@@ -499,9 +551,11 @@ def run_probe(gpu_physical_id: str, cfg: Config) -> list[float]:
     infer, extract = _bind_runner(cfg)
     fold = folding_input.Input.from_json(
         json.dumps(build_probe_json(1024, cfg.bench_seed)))
+    from fullFold.runner import load_ccd
+    ccd = load_ccd(fold)
     times = []
     for seed in fold.rng_seeds:
-        batch = featurise_one(fold, seed, [1024], cfg=cfg)
+        batch = featurise_one(fold, seed, [1024], ccd=ccd, cfg=cfg)
         t0 = time.time()
         job = type('J', (), {'name': fold.name})()
         extract(job, seed, batch, infer(job, seed, batch))
@@ -510,11 +564,8 @@ def run_probe(gpu_physical_id: str, cfg: Config) -> list[float]:
 
 
 def _write_input_json(job: Job, cfg: Config) -> None:
-    from alphafold3.common import folding_input
     from fullFold.runner import write_fold_input_json
-    write_fold_input_json(
-        folding_input.Input.from_json(job.path.read_text(), job.path),
-        cfg.output_dir / job.job_id)
+    write_fold_input_json(_load_fold(job)[0], cfg.output_dir / job.job_id)
 
 
 @contextlib.contextmanager

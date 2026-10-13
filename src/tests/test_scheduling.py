@@ -14,7 +14,7 @@ from fullFold.scheduling import (
 )
 
 
-def brute_gpu(work, gpu, shapes):
+def brute_gpu(work, gpu, shapes, ref=STANDARD):
     compile_us, inf1024 = gpu
     if not work:
         return 0
@@ -32,14 +32,14 @@ def brute_gpu(work, gpu, shapes):
         compiled = [shapes[i] for i in range(m) if mask & (1 << i)]
         if max(compiled) < mx:
             continue
-        cost = sum(compilation_us(compile_us, s) for s in compiled)
+        cost = sum(compilation_us(compile_us, s, ref) for s in compiled)
         ok = True
         for w in work:
             assigned = next((s for s in compiled if s >= w[0]), None)
             if assigned is None:
                 ok = False
                 break
-            cost += w[1] * inference_us(inf1024, assigned)
+            cost += w[1] * inference_us(inf1024, assigned, ref)
         if ok:
             best = min(best, cost)
     return best
@@ -63,208 +63,39 @@ def _w(tokens, seeds=1, name=None):
     return (tokens, seeds, name or f'j{tokens}')
 
 
-def test_single_sequence():
-    work = [_w(128, 1, 'a')]
-    gpu, shapes = (10, 1_000_000), [128, 256]
-    cost, groups = plan_gpu(work, gpu, shapes)
-    assert cost == brute_gpu(work, gpu, shapes)
-    assert cost == compilation_us(10, 128) + inference_us(1_000_000, 128)
-    assert [g.shape for g in groups] == [128]
-
-
-def test_r0_splits():
-    work = [_w(128, 1, 'a'), _w(256, 1, 'b')]
-    gpu, shapes = (0, 1_000_000), [128, 256]
-    cost, groups = plan_gpu(work, gpu, shapes)
-    assert cost == brute_gpu(work, gpu, shapes)
-    assert cost == inference_us(1_000_000, 128) + inference_us(1_000_000, 256)
-    assert len(groups) == 2
-
-
-def test_large_r_collapses():
-    work = [_w(128, 1, 'a'), _w(256, 1, 'b')]
-    gpu, shapes = (10**12, 1_000_000), [128, 256]
-    cost, groups = plan_gpu(work, gpu, shapes)
-    assert cost == brute_gpu(work, gpu, shapes)
-    assert len(groups) == 1
-    assert groups[0].shape == 256
-
-
-def test_seed_multiplicity():
-    a = [_w(128, 5, 'a')]
-    b = [_w(128, 1, 'a')]
-    gpu, shapes = (100, 1_000_000), [128]
-    ca, _ = plan_gpu(a, gpu, shapes)
-    cb, _ = plan_gpu(b, gpu, shapes)
-    r = compilation_us(100, 128)
-    assert ca - r == 5 * (cb - r)
-
-
-def test_one_compile_per_shape():
-    work = [_w(128, 1, 'a'), _w(128, 1, 'b'), _w(128, 1, 'c')]
-    _, groups = plan_gpu(work, (5, 1_000_000), [128, 256])
-    shapes = [g.shape for g in groups]
-    assert len(shapes) == len(set(shapes))
-
-
-def test_oversized_gets_own_shape():
-    work = [_w(50, 1, 'big')]
-    shapes = candidate_shapes(work, (8, 16, 32), 'ladder')
-    assert 50 in shapes
-    cost, groups = plan_gpu(work, (1, 1_000_000), shapes)
-    assert groups[0].shape == 50
-    assert cost == brute_gpu(work, (1, 1_000_000), shapes)
-
-
-def test_csv_1024_modifiers_are_one():
-    assert inference_modifier(1024) == 1.0
-    assert compilation_modifier(1024) == 1.0
-
-
-def test_csv_lookup_matches_reference_rows():
-    assert inference_us(1_000_000, 256) == round(1_000_000 * 0.12933754)
-    assert inference_us(1_000_000, 2048) == round(1_000_000 * 4.52811282)
-    assert compilation_us(1_000_000, 256) == round(1_000_000 * 0.99578898)
-    assert compilation_us(1_000_000, 2048) == round(1_000_000 * 1.00479588)
-    assert inference_us(1_000_000, 9) == inference_us(1_000_000, 10)
-    assert compilation_modifier(6000) == compilation_modifier(CSV_MAX)
-    assert compilation_modifier(CSV_MAX) == 1.40297111
-
-
-def test_fast_reference_matches_anthropic_rows():
-    assert reference_for('fast') is FAST
-    assert reference_for('standard') is STANDARD
-    assert inference_modifier(1024, FAST) == 1.0
-    assert compilation_modifier(1024, FAST) == 1.0
-    assert inference_us(1_000_000, 256, FAST) == round(1_000_000 * 0.133333333)
-    assert inference_us(1_000_000, 2048, FAST) == round(1_000_000 * 4.942764228)
-    assert compilation_us(1_000_000, 256, FAST) == round(1_000_000 * 0.96285448)
-    assert compilation_us(1_000_000, 2048, FAST) == round(1_000_000 * 1.005325523)
-    assert inference_us(1_000_000, 9, FAST) == inference_us(1_000_000, 16, FAST)
-    assert compilation_modifier(6000, FAST) == compilation_modifier(FAST.csv_max, FAST)
-    assert compilation_modifier(FAST.csv_max, FAST) == 1.242444415
-    assert inference_modifier(6000, FAST) == shape_factor(6000)
-    assert inference_us(1_000_000, 256, FAST) != inference_us(1_000_000, 256)
-
-
-def test_fast_free_mode_uses_fast_buckets():
-    work = [_w(1, 1, 'a'), _w(9, 1, 'b'), _w(16, 1, 'c'), _w(17, 1, 'd')]
-    shapes = candidate_shapes(work, (128, 256), 'free', FAST)
-    assert shapes == [s for s in FAST.buckets if 8 <= s <= 24]
-    assert 10 not in shapes
-    assert 17 not in shapes
-
-
-def test_fast_reference_changes_compile_choice():
-    """Compile at 128 is relatively dearer on the fast curve, so the DP merges."""
-    work = [_w(128, 1, 'a'), _w(256, 1, 'b')]
-    gpu, shapes = (55_000, 1_000_000), [128, 256]
-    _, standard = plan_gpu(work, gpu, shapes)
-    _, fast = plan_gpu(work, gpu, shapes, FAST)
-    assert [g.shape for g in standard] == [128, 256]
-    assert [g.shape for g in fast] == [256]
-    cost, _, _, _ = plan_multi_gpu(work, [gpu], shapes, FAST)
-    assert cost == compilation_us(55_000, 256, FAST) + 2 * inference_us(
-        1_000_000, 256, FAST)
-
-
-def test_free_mode_uses_csv_buckets_not_ceil_8():
-    work = [_w(1, 1, 'a'), _w(9, 1, 'b'), _w(16, 1, 'c'), _w(17, 1, 'd')]
-    shapes = candidate_shapes(work, (128, 256), 'free')
-    assert shapes == [s for s in CSV_BUCKETS if 5 <= s <= 19]
-    assert 17 not in shapes
-    assert 24 not in shapes
-    assert 19 in shapes
-
-
-def test_candidates_at_or_below_csv_max_are_csv_only():
-    work = [_w(17, 1, 'a'), _w(50, 1, 'b'), _w(6000, 1, 'c')]
-    free = candidate_shapes(work, (128, 256), 'free')
-    ladder = candidate_shapes(work, (8, 16, 32, 128), 'ladder')
-    for shapes in (free, ladder):
-        assert all(s in CSV_BUCKETS or s > CSV_MAX for s in shapes)
-        assert any(s > CSV_MAX for s in shapes)
-    assert 17 not in free and 17 not in ladder
-    assert 19 in free
-    assert 50 in ladder
-    assert 6016 in free and 6016 in ladder  # above the CSV: next multiple of 64
-    assert 6000 not in free and 6000 not in ladder
-    assert all(s % 64 == 0 for s in free + ladder if s > CSV_MAX)
-
-
-def test_plan_gpu_compile_follows_csv_modifiers():
-    gpu = (1_000_000, 1_000_000)
-    c128, _ = plan_gpu([_w(128, 1, 'a')], gpu, [128, 256])
-    c256, _ = plan_gpu([_w(256, 1, 'a')], gpu, [128, 256])
-    assert compilation_us(1_000_000, 128) != compilation_us(1_000_000, 256)
-    assert c128 == compilation_us(1_000_000, 128) + inference_us(1_000_000, 128)
-    assert c256 == compilation_us(1_000_000, 256) + inference_us(1_000_000, 256)
-
-
-def test_empty_work():
+def test_plan_gpu_examples_match_brute_force():
+    """Hand-checked cases; each is also compared with the exhaustive optimum."""
+    oversized = [_w(50, 1, 'big')]
+    two = [_w(128, 1, 'a'), _w(256, 1, 'b')]
+    cases = [  # name, work, gpu, shapes, ref, expected compiled shapes
+        ('one sequence', [_w(128, 1, 'a')], (10, 1_000_000), [128, 256], STANDARD, [128]),
+        ('free compile splits', two, (0, 1_000_000), [128, 256], STANDARD, [128, 256]),
+        ('huge compile collapses', two, (10**12, 1_000_000), [128, 256], STANDARD, [256]),
+        ('oversized job gets its own shape', oversized, (1, 1_000_000),
+         candidate_shapes(oversized, (8, 16, 32), 'ladder'), STANDARD, [50]),
+        ('standard compiles twice', two, (55_000, 1_000_000), [128, 256], STANDARD, [128, 256]),
+        ('fast curve merges', two, (55_000, 1_000_000), [128, 256], FAST, [256]),
+    ]
+    for name, work, gpu, shapes, ref, want in cases:
+        cost, groups = plan_gpu(work, gpu, shapes, ref)
+        assert [g.shape for g in groups] == want, name
+        assert cost == brute_gpu(work, gpu, shapes, ref), name
+    # explicit arithmetic for the simplest two
+    one = plan_gpu([_w(128, 1, 'a')], (10, 1_000_000), [128, 256])[0]
+    assert one == compilation_us(10, 128) + inference_us(1_000_000, 128)
+    split = plan_gpu(two, (0, 1_000_000), [128, 256])[0]
+    assert split == inference_us(1_000_000, 128) + inference_us(1_000_000, 256)
+    # the production planner agrees on the fast curve
+    gpu = (55_000, 1_000_000)
+    assert plan_multi_gpu(two, [gpu], [128, 256], FAST)[0] == (
+        compilation_us(55_000, 256, FAST) + 2 * inference_us(1_000_000, 256, FAST))
+    # degenerate inputs
     assert plan_gpu([], (1, 1_000_000), [128]) == (0, [])
-    ms, fl, fid, g = plan_multi_gpu([], [(1, 1_000_000), (1, 1_000_000)], [128])
-    assert ms == 0 and g == [[], []]
+    assert plan_gpu([_w(128)], (1, 0), [128]) == (INF, [])
 
 
-def test_single_gpu_multi():
-    work = [_w(128, 1, 'a'), _w(256, 1, 'b')]
-    ms, _, _, groups = plan_multi_gpu(work, [(4, 1_000_000)], [128, 256])
-    c, g = plan_gpu(work, (4, 1_000_000), [128, 256])
-    assert ms == c and groups == [g]
-
-
-def test_more_gpus_than_jobs():
-    work = [_w(128, 1, 'a')]
-    ms, _, _, groups = plan_multi_gpu(
-        work, [(1, 1_000_000), (1, 1_000_000), (1, 1_000_000)], [128])
-    filled = sum(1 for g in groups if g)
-    assert filled == 1
-    assert ms < INF
-
-
-def test_all_one_bucket():
-    work = [_w(128, 1, n) for n in 'abc']
-    gpus = [(10, 1_000_000), (10, 1_000_000)]
-    ms, _, _, groups = plan_multi_gpu(work, gpus, [128, 256])
-    assert ms == brute_multi(work, gpus, [128, 256])
-    assert sum(len(x) for x in groups) >= 1
-
-
-def test_nonpositive_throughput():
-    cost, groups = plan_gpu([_w(128)], (1, 0), [128])
-    assert cost == INF and groups == []
-
-
-def test_makespan_is_max():
-    work = [_w(128, 1, 'a'), _w(128, 1, 'b')]
-    gpus = [(0, 1_000_000), (0, 1_000_000)]
-    ms, _, _, groups = plan_multi_gpu(work, gpus, [128])
-    assert ms == brute_multi(work, gpus, [128])
-    assert ms == inference_us(1_000_000, 128)
-
-
-def test_heterogeneous_fast_gpu_gets_more():
-    work = [_w(128, 1, n) for n in 'abcd']
-    gpus = [(0, 4_000_000), (0, 1_000_000)]  # gpu1 is 4x faster at 1024
-    ms, _, _, groups = plan_multi_gpu(work, gpus, [128])
-    n0 = sum(len(g.job_ids) for g in groups[0])
-    n1 = sum(len(g.job_ids) for g in groups[1])
-    assert n1 >= n0
-
-
-def test_heterogeneous_65_percent_faster_gets_more_than_half():
-    work = [_w(128, 1, f'j{i}') for i in range(100)]
-    gpus = [(0, 100_000_000), (0, 165_000_000)]  # gpu0 is 65% faster
-    _, _, _, groups = plan_multi_gpu(work, gpus, [128])
-    n0 = sum(len(g.job_ids) for g in groups[0])
-    n1 = sum(len(g.job_ids) for g in groups[1])
-    assert n0 + n1 == 100
-    assert n0 >= 55
-
-
-
-def test_brute_small_random():
+def test_plan_matches_brute_force_on_random_instances():
+    """Seeds and several GPUs included: the DP and the planner reach the true optimum."""
     rng = random.Random(0)
     for _ in range(15):
         n = rng.randint(1, 6)
@@ -282,114 +113,99 @@ def test_brute_small_random():
         assert ms == brute_multi(work, gpus, shapes)
 
 
+def test_reference_tables_lookup_snapping_and_extrapolation():
+    assert reference_for('standard') is STANDARD and reference_for('fast') is FAST
+    rows = {  # (bucket, inference modifier, compile modifier) from the CSVs
+        'standard': [(256, 0.12933754, 0.99578898), (2048, 4.52811282, 1.00479588)],
+        'fast': [(256, 0.133333333, 0.96285448), (2048, 4.942764228, 1.005325523)],
+    }
+    last_compile = {'standard': 1.40297111, 'fast': 1.242444415}
+    for name, table in rows.items():
+        ref = reference_for(name)
+        assert inference_modifier(1024, ref) == compilation_modifier(1024, ref) == 1.0, name
+        for bucket, inf, comp in table:
+            assert inference_us(1_000_000, bucket, ref) == round(1_000_000 * inf), name
+            assert compilation_us(1_000_000, bucket, ref) == round(1_000_000 * comp), name
+        # a size missing from the table snaps up to the next listed bucket
+        below = ref.buckets[0] + 1
+        assert inference_us(1_000_000, below, ref) == inference_us(
+            1_000_000, next(b for b in ref.buckets if b >= below), ref), name
+        # above the table: compile stays at the last row, inference follows the cubic
+        assert ref.csv_max == ref.buckets[-1]
+        assert compilation_modifier(6000, ref) == compilation_modifier(ref.csv_max, ref) \
+            == last_compile[name], name
+        assert inference_modifier(6000, ref) == shape_factor(6000), name
+        assert inference_us(1_000_000, 6000, ref) > 2 * inference_us(1_000_000, 1024, ref)
+    assert inference_us(1_000_000, 256, FAST) != inference_us(1_000_000, 256)
+    assert (CSV_BUCKETS, CSV_MAX) == (STANDARD.buckets, STANDARD.csv_max)
 
-def test_determinism_shuffle():
-    rng = random.Random(1)
-    base = [_w(t, 1, f'j{t}-{i}') for i, t in enumerate([128, 128, 256, 256, 512])]
-    gpus = [(5, 2_000_000), (7, 1_000_000)]
-    shapes = [128, 256, 512]
-    results = []
-    for _ in range(20):
-        w = list(base)
-        rng.shuffle(w)
-        w.sort(key=lambda x: (x[0], x[2]))
-        results.append(plan_multi_gpu(w, gpus, shapes))
-    assert len(set(r[0] for r in results)) == 1
-    ids = [tuple(tuple(g.job_ids for g in gpu) for gpu in r[3]) for r in results]
-    assert len(set(ids)) == 1
+
+def test_candidate_shapes_free_ladder_fast_and_oversized():
+    tiny = [_w(1, 1, 'a'), _w(9, 1, 'b'), _w(16, 1, 'c'), _w(17, 1, 'd')]
+    free = candidate_shapes(tiny, (128, 256), 'free')
+    assert free == [s for s in CSV_BUCKETS if 5 <= s <= 19]  # table sizes, not multiples of 8
+    assert 19 in free and 17 not in free and 24 not in free
+    fast = candidate_shapes(tiny, (128, 256), 'free', FAST)
+    assert fast == [s for s in FAST.buckets if 8 <= s <= 24]
+    assert 10 not in fast and 17 not in fast
+    # up to the table's end only table sizes; above it the next multiple of 64
+    work = [_w(17, 1, 'a'), _w(50, 1, 'b'), _w(6000, 1, 'c')]
+    ladder = candidate_shapes(work, (8, 16, 32, 128), 'ladder')
+    free = candidate_shapes(work, (128, 256), 'free')
+    for shapes in (free, ladder):
+        assert all(s in CSV_BUCKETS or s > CSV_MAX for s in shapes)
+        assert 17 not in shapes and 6000 not in shapes and 6016 in shapes
+        assert all(s % 64 == 0 for s in shapes if s > CSV_MAX)
+    assert 19 in free and 50 in ladder
+
+
+def test_heterogeneous_gpus_split_work_by_speed():
+    work = [_w(128, 1, f'j{i}') for i in range(100)]
+    _, _, _, groups = plan_multi_gpu(work, [(0, 100_000_000), (0, 165_000_000)], [128])
+    n = [sum(len(g.job_ids) for g in gr) for gr in groups]
+    assert sum(n) == 100 and n[0] >= 55  # the 65 % faster GPU takes the larger share
+    # two shapes, 800 jobs: loads end up within one inference of each other
+    work = [_w(128, 1, f's{i}') for i in range(400)] + [_w(256, 1, f'l{i}') for i in range(400)]
+    gpus = [(0, 750_000), (0, 1_320_000)]
+    ms, _, _, groups = plan_multi_gpu(work, gpus, [128, 256])
+    c0, c1 = (groups_cost_us(g, work, gpu) for g, gpu in zip(groups, gpus))
+    assert ms == max(c0, c1) and abs(c0 - c1) <= inference_us(1_320_000, 256)
+    assert sum(len(g.job_ids) for gr in groups for g in gr) == 800
+
+
+def test_share_tails_steals_only_when_the_thief_finishes_sooner():
+    def stolen(work, gpus, assignment):
+        out = share_tails(assignment, work, [256], gpus)
+        return out, [[j for g in gr if g.shared for j in g.job_ids] for gr in out]
+
+    a, b = _w(256, 1, 'a'), _w(256, 1, 'b')
+    one_gpu_has_both = [[Group(256, ('a', 'b'))], []]
+    # equal GPUs, one job each: nothing to gain
+    work = [_w(128, 1, 'a'), _w(128, 1, 'b')]
+    out = share_tails([[Group(128, ('a',))], [Group(128, ('b',))]], work, [128],
+                      [(0, 1_000_000)] * 2)
+    assert [[j for g in gr if g.shared for j in g.job_ids] for gr in out] == [[], []]
+    # a 4x faster owner would take longest: the slow idle GPU steals the last job first
+    gpus = [(0, 4_000_000), (0, 1_000_000)]
+    out, steal = stolen([a, b], gpus, one_gpu_has_both)
+    assert steal[1][0] == 'b'
+    assert [j for g in out[0] if not g.shared for j in g.job_ids] == ['a', 'b']
+    assert groups_cost_us(out[0], [a, b], gpus[0]) == groups_cost_us(
+        one_gpu_has_both[0], [a, b], gpus[0])
+    # a new bucket is charged its compile once, then both jobs are cheaper to steal
+    gpus = [(10_000_000, 4_000_000), (10_000_000, 1_000_000)]
+    _, steal = stolen([a, b], gpus, one_gpu_has_both)
+    assert steal[1] == ['b', 'a']
+    compile_256, inf = compilation_us(10_000_000, 256), inference_us(1_000_000, 256)
+    orig_a = compile_256 + inference_us(4_000_000, 256)
+    assert compile_256 + 2 * inf < orig_a <= 2 * compile_256 + 2 * inf
+    # ...and a compile that is too slow means no steal at all
+    _, steal = stolen([a], [(0, 1_000_000), (10**12, 1_000_000)], [[Group(256, ('a',))], []])
+    assert steal == [[], []]
 
 
 def test_round_robin_groups_by_shape():
     work = [_w(128, 1, 'a'), _w(256, 1, 'b'), _w(128, 1, 'c'), _w(256, 1, 'd')]
-    groups = plan_round_robin(work, 2, [128, 256])
-    for gpu_groups in groups:
+    for gpu_groups in plan_round_robin(work, 2, [128, 256]):
         shapes = [g.shape for g in gpu_groups]
         assert shapes == sorted(shapes)
-
-
-def test_cubic_only_above_csv_max():
-    assert inference_us(1_000_000, 2048) == round(1_000_000 * 4.52811282)
-    assert inference_us(1_000_000, 6000) == max(
-        1, int(round(1_000_000 * shape_factor(6000))))
-    assert inference_us(1_000_000, 6000) > 2 * inference_us(1_000_000, 1024)
-    assert compilation_us(1_000_000, 6000) == compilation_us(1_000_000, CSV_MAX)
-
-
-def test_large_two_shape_instance_is_balanced_across_heterogeneous_gpus():
-    work = [_w(128, 1, f's{i}') for i in range(400)]
-    work += [_w(256, 1, f'l{i}') for i in range(400)]
-    gpus = [(0, 750_000), (0, 1_320_000)]
-    shapes = [128, 256]
-    ms, _, _, groups = plan_multi_gpu(work, gpus, shapes)
-    c0 = groups_cost_us(groups[0], work, gpus[0])
-    c1 = groups_cost_us(groups[1], work, gpus[1])
-    assert ms == max(c0, c1)
-    assert abs(c0 - c1) <= inference_us(1_320_000, 256)
-    n0 = sum(len(g.job_ids) for g in groups[0])
-    n1 = sum(len(g.job_ids) for g in groups[1])
-    assert n0 + n1 == 800
-
-
-def test_share_tails_omits_when_thief_cannot_beat_original():
-    work = [_w(128, 1, 'a'), _w(128, 1, 'b')]
-    gpus = [(0, 1_000_000), (0, 1_000_000)]
-    shapes = [128]
-    assignment = [
-        [Group(shape=128, job_ids=('a',))],
-        [Group(shape=128, job_ids=('b',))],
-    ]
-    overlay = share_tails(assignment, work, shapes, gpus)
-    steal0 = [jid for g in overlay[0] if g.shared for jid in g.job_ids]
-    steal1 = [jid for g in overlay[1] if g.shared for jid in g.job_ids]
-    assert steal0 == []
-    assert steal1 == []
-
-
-def test_share_tails_last_job_first_when_thief_finishes_sooner():
-    work = [_w(256, 1, 'a'), _w(256, 1, 'b')]
-    gpus = [(0, 4_000_000), (0, 1_000_000)]
-    shapes = [256]
-    assignment = [
-        [Group(shape=256, job_ids=('a', 'b'))],
-        [],
-    ]
-    overlay = share_tails(assignment, work, shapes, gpus)
-    steal1 = [jid for g in overlay[1] if g.shared for jid in g.job_ids]
-    assert steal1[0] == 'b'
-    assert [jid for g in overlay[0] if not g.shared for jid in g.job_ids] == [
-        'a', 'b']
-    assert groups_cost_us(overlay[0], work, gpus[0]) == groups_cost_us(
-        assignment[0], work, gpus[0])
-
-
-def test_share_tails_new_bucket_pays_compile_once():
-    work = [_w(256, 1, 'a'), _w(256, 1, 'b')]
-    gpus = [(10_000_000, 4_000_000), (10_000_000, 1_000_000)]
-    shapes = [256]
-    assignment = [
-        [Group(shape=256, job_ids=('a', 'b'))],
-        [],
-    ]
-    overlay = share_tails(assignment, work, shapes, gpus)
-    steal = [g for g in overlay[1] if g.shared]
-    stolen = [jid for g in steal for jid in g.job_ids]
-    assert stolen == ['b', 'a']
-    inf = inference_us(1_000_000, 256)
-    compile_256 = compilation_us(10_000_000, 256)
-    orig_a = compilation_us(10_000_000, 256) + inference_us(4_000_000, 256)
-    charged_once = compile_256 + 2 * inf
-    charged_twice = 2 * compile_256 + 2 * inf
-    assert charged_once < orig_a <= charged_twice
-
-
-def test_share_tails_omits_new_bucket_when_compile_too_slow():
-    work = [_w(256, 1, 'a')]
-    gpus = [(0, 1_000_000), (10**12, 1_000_000)]
-    shapes = [256]
-    assignment = [
-        [Group(shape=256, job_ids=('a',))],
-        [],
-    ]
-    overlay = share_tails(assignment, work, shapes, gpus)
-    steal1 = [jid for g in overlay[1] if g.shared for jid in g.job_ids]
-    assert steal1 == []

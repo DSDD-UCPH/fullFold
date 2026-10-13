@@ -100,7 +100,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument('--template', type=Path, required=True)
     p.add_argument('--records', type=Path, required=True)
     p.add_argument('--output-dir', type=Path, required=True)
-    p.add_argument('--type', dest='record_type', default='protein')
+    p.add_argument('--type', dest='record_type', default='protein',
+                   choices=('protein', 'rna', 'dna', 'ligand'),
+                   help='Kind of FASTA / CSV sequence records (SMILES are always '
+                        'ligands). "ligand" is accepted only to explain why a '
+                        'FASTA cannot hold one.')
 
     args = parser.parse_args(argv)
     if args.cmd != 'template':
@@ -131,6 +135,7 @@ def main(argv: list[str] | None = None) -> int:
                 'cond_share', 'atom_cond_hoist', 'diffusion_hoist',
                 'hoist_logits',
             ) if statuses[n].active
+            and not (n == 'hoist_logits' and args.hoist_logits is False)
         )
         for line in notices(statuses):
             print(line, file=sys.stderr)

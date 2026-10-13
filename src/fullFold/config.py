@@ -32,6 +32,7 @@ FAST_ENV = {
     'AF3_JAX_ATOM_COND_HOIST': '1',
 }
 XLA_TRITON_GEMM_OFF = '--xla_gpu_enable_triton_gemm=false'
+_TRITON_GEMM_FLAG = '--xla_gpu_enable_triton_gemm'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -197,8 +198,11 @@ def worker_environ(
     cache.mkdir(parents=True, exist_ok=True)
     env['AF3SCHED_JAX_CACHE'] = str(cache)
     if cfg.mode == 'fast':
-        if not (env.get('XLA_FLAGS') or '').strip():
-            env['XLA_FLAGS'] = XLA_TRITON_GEMM_OFF
+        # Keep the user's flags, and add the one fast mode needs unless they
+        # already chose a value for it.
+        flags = (env.get('XLA_FLAGS') or '').split()
+        if not any(f.split('=')[0] == _TRITON_GEMM_FLAG for f in flags):
+            env['XLA_FLAGS'] = ' '.join([*flags, XLA_TRITON_GEMM_OFF])
         for key, value in FAST_ENV.items():
             env.setdefault(key, value)
         if cfg.sampler_bf16 is not None:

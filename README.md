@@ -22,7 +22,9 @@ pip install .
 pip install fullfold
 ```
 
-Then run `fullfold` / `fullFold` (same command) or `python -m fullFold` from any directory.
+Then run `fullfold` / `fullFold` (same command) or `python -m fullFold` from any directory. To update, run `pip install --upgrade fullfold`.
+
+Don't have AlphaFold 3 set up yet? See [docs/installation.md](docs/installation.md) for a from-scratch guide (conda, uv, Docker / Singularity).
 
 ## Quickstart
 
@@ -80,8 +82,8 @@ Resume is the same command: completed jobs (matching `done.json` hash) are skipp
 | Command     | What it does                                                                                                                                   |
 | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
 | `run`       | All-in-one command: will run scan the AF3 json, plan them, and then execute. `--dry-run` stops after plan                                      |
-| `scan`      | Verify and calculate the tokens for every `*.json` in `--input-dir` (writes `ledger.jsonl`)                                                    |
-| `benchmark` | 1024-token 4-seed probe per GPU; cached under `~/.cache/fullFold/bench/` (separate files per `--mode` and active hoist set) |
+| `scan`      | Verify and calculate the tokens for every `*.json` in `--input-dir` that is not already done (writes `ledger.jsonl`). Inputs whose `name` is unusable, or sanitises to the same job id as an earlier file (ignoring case), are rejected and listed |
+| `benchmark` | 1024-token 4-seed probe per GPU; cached under `~/.cache/fullFold/bench/` (separate files per `--mode`, `--model`, active hoist set and JAX / AlphaFold 3 / af3-faster versions; a contaminated probe is used once and not cached) |
 | `plan`      | Scan + write per-GPU manifests. Probes only on mixed GPU names, `--force-benchmark`, or a `benchmark` cache already on disk |
 | `template`  | Quickly setting up batch screens, from a template JSON file combined with each record in a FASTA / CSV / SMI file (one output JSON per record) |
 
@@ -143,11 +145,11 @@ All tunables live in `config.py` (`Config`). Defaults:
 | `reference`                   | `standard`                | `standard` = `reference_timings.csv`; `fast` = Anthropic fast-mode modifiers in `reference_timing_fast.csv`                                                      |
 | `buckets`                     | AF3 128..5120             | Candidate compile shapes                                                                                                                                         |
 | `bucket_margin`               | `0.05`                    | Near-boundary token counts escalate to exact count                                                                                                               |
-| `stale_lock_seconds`          | `900`                     | Reclaim a lock whose mtime is older than this                                                                                                                    |
+| `stale_lock_seconds`          | `900`                     | Reclaim a lock that has had no heartbeat for this long. A running worker refreshes its locks every `min(60, stale_lock_seconds / 4)` s, so long jobs are not mistaken for dead ones |
 | `retry_failed`                | `False`                   | Re-run jobs with `failed.json`                                                                                                                                   |
 | `force_benchmark`             | `False`                   | Ignore the probe cache                                                                                                                                           |
 | `bench_seed`                  | `42`                      | RNG seed for the 1024-token probe protein                                                                                                                        |
-| `cache_dir`                   | `~/.cache/fullFold/bench` | Per-host, per-PCI probe cache; the file name includes `device_kind`, `--mode`, `--model`, and the active hoist set                                                |
+| `cache_dir`                   | `~/.cache/fullFold/bench` | Per-host, per-PCI probe cache; the file name includes `device_kind`, the JAX and AlphaFold 3 versions, `--mode`, `--model`, and the active hoist set                |
 | `jax_compilation_cache_dir`   | `None`                    | Root for the per-host, per-GPU-name JAX compile cache (default `<cache_dir>/jax/<host>__<name>/`; reuse follows JAX's GPU-name topology, not compute capability) |
 | `xla_mem_fraction`            | auto (total − 640 MiB)    | `XLA_CLIENT_MEM_FRACTION` in workers. Automatic from nvidia-smi `memory.total`; an explicit `--xla-mem-fraction` overrides. Unknown memory falls back to 0.95   |
 | `xla_preallocate`             | `True`                    | `XLA_PYTHON_CLIENT_PREALLOCATE`                                                                                                                                  |
@@ -176,8 +178,8 @@ All tunables live in `config.py` (`Config`). Defaults:
 
 Per job, under `<output-dir>/<sanitised-name>/.af3sched/`:
 
-- `lock` — `O_CREAT|O_EXCL`, reclaimed if this host's pid is dead or mtime is stale
-- `done.json` — written atomically; skip on resume if `sha256` matches
+- `lock` — `O_CREAT|O_EXCL`. The owner refreshes its mtime while it runs. It is reclaimed if this host's pid is dead or the mtime is older than `--stale-lock-seconds`; reclaiming renames the old lock away first, so only one contender wins
+- `done.json` — written atomically as soon as the job's last seed has been written (not at the end of its bucket); skip on resume if `sha256` matches
 - `failed.json` — skip on resume unless `--retry-failed`
 - `af3.log` — AlphaFold 3 stdout/stderr for that job
 
@@ -190,7 +192,7 @@ Under `<output-dir>/_af3sched/`:
 
 ## Templates
 
-SMILES are always ligands. Kind comes from the file extension (`.smi` / `.smiles`), a CSV `smiles` column, or `--type`. The same string `CCCC` is a ligand from `.smi` and a protein from FASTA. `--type ligand` on a FASTA is refused.
+SMILES are always ligands. Kind comes from the file extension (`.smi` / `.smiles`), a CSV `smiles` column, or `--type` (`protein`, `rna` or `dna`; a CSV `type` column takes the same values, and anything else is an error). The same string `CCCC` is a ligand from `.smi` and a protein from FASTA. `--type ligand` on a FASTA is refused.
 
 Added proteins get `"unpairedMsa": ""`, `"pairedMsa": ""`, `"templates": []` (MSA-free). That is how a de novo or peptide screen skips the AlphaFold 3 data pipeline. Existing template chains are not touched. `modelSeeds` is copied verbatim and never synthesised.
 

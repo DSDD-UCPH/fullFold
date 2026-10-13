@@ -1,4 +1,4 @@
-"""Import graph: no cycles; jax only at module level in worker.py."""
+"""Import graph: no cycles, a pure planning core, and JAX only where it is expected."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1] / 'fullFold'
 MODS = (
-    'config', 'tokens', 'jobs', 'scheduling', 'benchmark',
+    'config', 'tokens', 'jobs', 'scheduling', 'planner', 'benchmark',
     'runner', 'worker', 'engine', 'templates', 'cli', 'banner', 'af3args',
 )
 
@@ -60,24 +60,16 @@ def test_no_cycles():
         dfs(m, [])
 
 
-def test_jax_import_sites():
-    toplevel_jax = []
-    for m in MODS:
-        for name, top in _imports(m):
-            if name == 'jax' or name.startswith('jax.'):
-                if top:
-                    toplevel_jax.append(m)
-    assert toplevel_jax == ['worker'] or toplevel_jax == []
-    # worker is allowed to import jax at module level; currently it is lazy.
+def test_the_planning_core_is_pure_and_jax_stays_where_it_belongs():
+    # scheduling and planner: standard library only (planner may use scheduling)
+    allowed = {'scheduling': set(), 'planner': {'fullFold.scheduling'}}
+    for name, ok in allowed.items():
+        for mod, _ in _imports(name):
+            assert mod not in ('jax', 'alphafold3') and not mod.startswith(('jax.', 'alphafold')), name
+            assert not mod.startswith('fullFold') or mod in ok, (name, mod)
+    # JAX is imported only lazily, and only by the modules that run the model
     allowed_lazy = {'worker', 'tokens', 'benchmark', 'runner'}
     for m in MODS:
         for name, top in _imports(m):
-            if (name == 'jax' or name.startswith('jax.')) and m not in allowed_lazy:
-                raise AssertionError(f'{m} imports jax')
-
-
-def test_scheduling_is_pure():
-    for name, _ in _imports('scheduling'):
-        assert not name.startswith('fullFold') or name == 'fullFold.scheduling'
-        assert 'jax' not in name
-        assert 'alphafold' not in name
+            if name == 'jax' or name.startswith('jax.'):
+                assert m in allowed_lazy and not top, f'{m} imports {name}'

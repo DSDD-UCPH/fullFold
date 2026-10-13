@@ -43,7 +43,7 @@ def main(argv: list[str] | None = None) -> int:
             return rc if isinstance(rc, int) else 1
     payload = {
         'target_version': TARGET_VERSION,
-        'hashes': {k: [v] for k, v in hashes.items()},
+        'hashes': hashes,
     }
     dest = fingerprints_path()
     dest.write_text(json.dumps(payload, indent=2, sort_keys=True) + '\n')

@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 from fullFold.benchmark import (
-    Bench, Gpu, discover_gpus, get_or_measure, gpu_multiplier, is_probed,
+    Bench, Gpu, discover_gpus, get_or_measure, gpu_multiplier, is_probed, measure,
     to_scheduler_gpu,
 )
 from fullFold.config import (
@@ -40,7 +43,27 @@ def write_ledger(cfg: Config, jobs: list[Job], rejected: list[str]):
     write_atomic(path, '\n'.join(lines) + ('\n' if lines else ''))
     if rejected:
         write_atomic(root / 'rejected.txt', '\n'.join(rejected) + '\n')
+    else:
+        (root / 'rejected.txt').unlink(missing_ok=True)  # do not leave last run's
     return path
+
+
+def report_scan(
+    cfg: Config, jobs: list[Job], rejected: list[str], *, limit: int | None = None,
+) -> None:
+    """Say what the scan found, including what it refused and what it only estimated."""
+    print(f'scanned {len(jobs)} jobs, rejected {len(rejected)}')
+    shown = rejected if limit is None else rejected[:limit]
+    for r in shown:
+        print(f'  reject: {r}')
+    if len(shown) < len(rejected):
+        print(f'  ... {len(rejected) - len(shown)} more in '
+              f'{cfg.output_dir / "_af3sched" / "rejected.txt"}')
+    estimated = sum(1 for j in jobs if not j.exact)
+    if estimated:
+        print(f'note: {estimated} job(s) use an estimated token count because exact '
+              'tokenization was unavailable or failed; an underestimate fails that '
+              "job with 'token dim != shape'.")
 
 
 def write_manifests(
@@ -400,7 +423,19 @@ def report(
             print(f'WARNING: {len(shared)} compiled shapes are duplicated across GPUs')
 
 
-def summarise_run(cfg: Config, meta: dict, wall_s: float) -> None:
+def event_log_offsets(root: Path, gpus: list[Gpu]) -> dict[int, int]:
+    """Current size of each ``gpu*.jsonl``. The logs are appended to across runs,
+    so a run reads from here to see only its own events."""
+    out = {}
+    for gpu in gpus:
+        path = root / f'gpu{gpu.slot}.jsonl'
+        out[gpu.slot] = path.stat().st_size if path.is_file() else 0
+    return out
+
+
+def summarise_run(
+    cfg: Config, meta: dict, wall_s: float, offsets: dict[int, int] | None = None,
+) -> None:
     root = cfg.output_dir / '_af3sched'
     probed = bool(meta.get('probed', True))
     if probed:
@@ -411,27 +446,51 @@ def summarise_run(cfg: Config, meta: dict, wall_s: float) -> None:
             print(f'actual / estimated:     {wall_s / pred_s:.2f}x')
     else:
         print(f'actual running time:    {wall_s:.1f}s')
+    offsets = offsets or {}
     for i, exp in enumerate(meta.get('compiles_per_gpu') or []):
-        path = root / f'gpu{i}.jsonl'
-        got = 0
-        if path.is_file():
-            for line in path.read_text().splitlines():
-                if line and json.loads(line).get('event') == 'group_start':
-                    got += 1
+        _, events = _jsonl_new_events(root / f'gpu{i}.jsonl', offsets.get(i, 0))
+        got = sum(1 for ev in events if ev.get('event') == 'group_start')
         print(f'  GPU {i}: expected compiles={exp} realised={got}')
 
 
 def cmd_scan(cfg: Config) -> int:
     jobs, rejected = scan(cfg)
     write_ledger(cfg, jobs, rejected)
-    print(f'scanned {len(jobs)} jobs, rejected {len(rejected)}')
-    for r in rejected:
-        print(f'  reject: {r}')
+    report_scan(cfg, jobs, rejected)
     return 0
 
 
+_WEIGHTS: dict[tuple[str, str], Path] = {}
+_WEIGHTS_LOCK = threading.Lock()
+
+
+def ensure_weights(cfg: Config) -> Path:
+    """Resolve ``cfg.model``'s weights once, here, before any worker starts.
+
+    Workers resolve them again, but find them in place: with several GPUs they
+    would otherwise all try to download the same file at once, and a missing
+    file would only surface after the benchmark. Returns the directory to pass
+    to workers (it differs from ``--model-dir`` when a download had to go elsewhere).
+    """
+    from fullFold.runner import canonical_model, resolve_model_dir
+    key = (cfg.model, str(cfg.model_dir))
+    with _WEIGHTS_LOCK:
+        hit = _WEIGHTS.get(key)
+        if hit is None:
+            root = Path(cfg.model_dir).expanduser()
+            if canonical_model(cfg.model) == 'alphafold3' and not root.is_dir():
+                raise SystemExit(f'fullFold: model directory not found: {root}')
+            hit = _WEIGHTS[key] = resolve_model_dir(cfg)
+    return hit
+
+
+def _measure_with_weights(gpu: Gpu, cfg: Config) -> Bench:
+    return measure(gpu, dataclasses.replace(cfg, model_dir=ensure_weights(cfg)))
+
+
 def _gpus_and_benches(cfg: Config, *, require: bool = False):
-    return get_or_measure(discover_gpus(cfg), cfg, require=require)
+    return get_or_measure(
+        discover_gpus(cfg), cfg, measure_fn=_measure_with_weights, require=require)
 
 
 def cmd_benchmark(cfg: Config) -> int:
@@ -441,31 +500,61 @@ def cmd_benchmark(cfg: Config) -> int:
     return 0
 
 
-def _prepare(cfg: Config):
+class Prepared(NamedTuple):
+    jobs: list[Job]
+    rejected: list[str]
+    gpus: list[Gpu]
+    groups: list[list[Group]]
+    meta: dict
+
+
+def _prepare(cfg: Config) -> Prepared:
     jobs, rejected = scan(cfg)
     write_ledger(cfg, jobs, rejected)
+    report_scan(cfg, jobs, rejected, limit=10)
+    if not jobs:
+        print('nothing to run: no pending jobs' + (
+            ' (every input was rejected)' if rejected else ''))
+        return Prepared(jobs, rejected, [], [], {})
     benches = _gpus_and_benches(cfg)
     gpus = [g for g, _ in benches]
     groups, meta = make_plan(cfg, jobs, benches)
     write_manifests(cfg, jobs, gpus, groups, meta)
     report(groups, meta, gpus, jobs)
-    return jobs, gpus, groups, meta
+    return Prepared(jobs, rejected, gpus, groups, meta)
+
+
+def _exit_code(prep: Prepared) -> int:
+    """Nothing scheduled is success, unless inputs were refused."""
+    return 1 if (not prep.jobs and prep.rejected) else 0
 
 
 def cmd_plan(cfg: Config) -> int:
-    _prepare(cfg)
-    return 0
+    return _exit_code(_prepare(cfg))
+
+
+def worst_returncode(codes: list[int]) -> int:
+    """Largest failure among worker exit codes; a worker killed by a signal counts."""
+    bad = [128 - c if c < 0 else c for c in codes if c != 0]
+    return max(bad, default=0)
+
+
+_FORWARDED = tuple(
+    getattr(signal, name) for name in ('SIGINT', 'SIGTERM', 'SIGHUP')
+    if hasattr(signal, name))
 
 
 def run_workers(
     cfg: Config, gpus: list[Gpu], jobs: list[Job] | None = None,
     groups: list[list[Group]] | None = None,
+    offsets: dict[int, int] | None = None,
 ) -> tuple[int, float]:
     root = cfg.output_dir / '_af3sched'
     procs: list[subprocess.Popen] = []
     logs: list = []
-    watch: dict = {}
+    watch: dict = {'offsets': dict(offsets or {})}
     tty = sys.stdout.isatty()
+    previous: dict[int, object] = {}
 
     def _flush_jobs(*, force: bool = False) -> None:
         dirty = consume_worker_events(
@@ -473,8 +562,18 @@ def run_workers(
         if dirty or force:
             render_progress(gpus, watch, tty=tty)
 
+    def _fwd(signum, _frame):
+        for p in procs:
+            p.send_signal(signum)
+
     try:
-        for gpu in gpus:
+        # Workers get their own session, so a terminal's Ctrl-C reaches only this
+        # process and is forwarded exactly once (not once by the tty and once by us).
+        for signum in _FORWARDED:
+            previous[signum] = signal.signal(signum, _fwd)
+        for i, gpu in enumerate(gpus):
+            if groups is not None and not (i < len(groups) and groups[i]):
+                continue  # nothing assigned: do not load a model just to idle
             env = worker_environ(
                 cfg, gpu.physical_id, pci_bus_id=gpu.pci_bus_id,
                 device_kind=gpu.device_kind, memory_bytes=gpu.memory_bytes)
@@ -489,41 +588,44 @@ def run_workers(
                 '--slot', str(gpu.slot), '--prefetch', str(cfg.prefetch),
             ]
             procs.append(subprocess.Popen(
-                cmd, env=env, stdout=lf, stderr=subprocess.STDOUT))
+                cmd, env=env, stdout=lf, stderr=subprocess.STDOUT,
+                start_new_session=True))
 
-        def _fwd(signum, _frame):
-            for p in procs:
-                p.send_signal(signum)
-
-        signal.signal(signal.SIGINT, _fwd)
-        signal.signal(signal.SIGTERM, _fwd)
         t0 = time.time()
-        rc = 0
         if cfg.verbose:
             _flush_jobs(force=True)
-            while True:
+            while not all(p.poll() is not None for p in procs):
                 _flush_jobs()
-                if all(p.poll() is not None for p in procs):
-                    break
                 time.sleep(0.2)
-            for p in procs:
-                rc = max(rc, p.wait())
+            codes = [p.wait() for p in procs]
             _flush_jobs()
         else:
-            for p in procs:
-                rc = max(rc, p.wait())
+            codes = [p.wait() for p in procs]
+        rc = worst_returncode(codes)
         wall = time.time() - t0
         print(f'workers finished in {wall:.1f}s rc={rc}')
         return rc, wall
+    except BaseException:
+        for p in procs:  # a failure while launching must not leave workers behind
+            if p.poll() is None:
+                p.terminate()
+        raise
     finally:
+        for signum, handler in previous.items():
+            if handler is not None:
+                signal.signal(signum, handler)
         for lf in logs:
             lf.close()
 
 
 def cmd_run(cfg: Config) -> int:
-    jobs, gpus, groups, meta = _prepare(cfg)
-    if cfg.dry_run:
-        return 0
-    rc, wall = run_workers(cfg, gpus, jobs=jobs, groups=groups)
-    summarise_run(cfg, meta, wall)
+    prep = _prepare(cfg)
+    if not prep.jobs or cfg.dry_run:
+        return _exit_code(prep)
+    run_cfg = dataclasses.replace(cfg, model_dir=ensure_weights(cfg))
+    root = cfg.output_dir / '_af3sched'
+    offsets = event_log_offsets(root, prep.gpus)
+    rc, wall = run_workers(
+        run_cfg, prep.gpus, jobs=prep.jobs, groups=prep.groups, offsets=offsets)
+    summarise_run(cfg, prep.meta, wall, offsets)
     return rc

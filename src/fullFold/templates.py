@@ -11,6 +11,7 @@ from pathlib import Path
 
 from fullFold.config import Config, sanitise, write_atomic
 
+_POLYMERS = ('protein', 'rna', 'dna')
 _FASTA = {'.fa', '.fasta', '.faa', '.fna', '.fas'}
 _SMI = {'.smi', '.smiles'}
 _CSV = {'.csv', '.tsv'}
@@ -63,11 +64,19 @@ def alloc_ids(used: set[str], n: int) -> list[str]:
     return out
 
 
-def _flush_fasta(recs, header, chunks, kind, i):
+def _flush_fasta(recs, header, chunks, kind, line):
     if header is None:
         return
     recs.append(Record(kind, sanitise(header) or f'seq{len(recs)+1}',
-                       ''.join(chunks), header, 1, i))
+                       ''.join(chunks), header, 1, line))
+
+
+def _check_polymer(kind: str, where: str) -> str:
+    if kind not in _POLYMERS:
+        raise ValueError(
+            f'{where}: unknown record type {kind!r}; expected one of '
+            f'{", ".join(_POLYMERS)}')
+    return kind
 
 
 def _read_fasta(path: Path, kind: str) -> list[Record]:
@@ -75,15 +84,15 @@ def _read_fasta(path: Path, kind: str) -> list[Record]:
         raise ValueError(
             f'FASTA cannot be used for ligands; use a .smi file or a CSV smiles column ({path})'
         )
-    kind = kind if kind in ('protein', 'rna', 'dna') else 'protein'
-    recs, header, chunks = [], None, []
+    _check_polymer(kind, str(path))
+    recs, header, header_line, chunks = [], None, 0, []
     for i, line in enumerate(path.read_text().splitlines(), 1):
         if line.startswith('>'):
-            _flush_fasta(recs, header, chunks, kind, i)
-            header, chunks = line[1:].strip(), []
+            _flush_fasta(recs, header, chunks, kind, header_line)
+            header, header_line, chunks = line[1:].strip(), i, []
         else:
             chunks.append(line.strip())
-    _flush_fasta(recs, header, chunks, kind, i if recs or header else 1)
+    _flush_fasta(recs, header, chunks, kind, header_line)
     return recs
 
 
@@ -119,15 +128,22 @@ def _read_csv(path: Path, default_kind: str) -> list[Record]:
             elif ccd:
                 kind, payload = 'ligand_ccd', ccd
             elif seq:
-                t = (row.get(fields.get('type', ''), '') or default_kind).lower()
+                t = (row.get(fields.get('type', ''), '') or default_kind).strip().lower()
                 if t in ('ligand', 'ligand_smiles'):
                     raise ValueError(f'{path}:{i} type=ligand requires a smiles column')
-                kind, payload = (t if t in ('protein', 'rna', 'dna') else 'protein'), seq
+                kind, payload = _check_polymer(t, f'{path}:{i}'), seq
             else:
                 raise ValueError(f'{path}:{i} has neither sequence, smiles, nor ccd_codes')
             hid = (row.get(fields.get('id', ''), '') or '').strip() or f'rec{i}'
             desc = (row.get(fields.get('description', ''), '') or '').strip()
-            count = int(row.get(fields.get('count', ''), '1') or 1)
+            raw_count = (row.get(fields.get('count', ''), '') or '1').strip()
+            try:
+                count = int(raw_count)
+            except ValueError:
+                count = 0
+            if count < 1:
+                raise ValueError(
+                    f'{path}:{i} count must be a positive integer, got {raw_count!r}')
             recs.append(Record(kind, sanitise(hid) or f'rec{i}', payload, desc, count, i))
     return recs
 
@@ -225,7 +241,10 @@ def cmd_template(cfg: Config) -> int:
     template = json.loads(cfg.template.read_text())
     if not isinstance(template, dict):
         raise SystemExit('template must be an AlphaFold 3 JSON object')
-    recs = read_records(cfg.records, cfg.record_type)
+    try:
+        recs = read_records(cfg.records, cfg.record_type)
+    except ValueError as e:
+        raise SystemExit(f'fullFold: {e}')
     ok, errors = generate(template, recs, cfg.output_dir, cfg.template.stem)
     print(f'wrote {ok} JSON files to {cfg.output_dir}')
     for e in errors:

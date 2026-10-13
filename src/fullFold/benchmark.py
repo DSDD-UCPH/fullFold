@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import subprocess
 import sys
 import warnings
 from dataclasses import asdict, dataclass
+from importlib import metadata
 from pathlib import Path
 
 from fullFold.config import Config, host_id, worker_environ, write_atomic
@@ -129,6 +131,44 @@ def discover_gpus(cfg: Config, rows: list[dict] | None = None) -> list[Gpu]:
     return gpus
 
 
+@functools.lru_cache(maxsize=None)
+def _dist_version(*names: str) -> str:
+    """Version of the first installed distribution in ``names`` (no import)."""
+    for name in names:
+        try:
+            return metadata.version(name)
+        except metadata.PackageNotFoundError:
+            continue
+    return ''
+
+
+def runtime_versions() -> tuple[str, str]:
+    """(jax, alphafold3) version strings for the probe-cache key.
+
+    Read from package metadata, so the parent never imports JAX. A probe is a
+    measurement of one software stack: a new JAX/XLA, AlphaFold 3 or af3-faster
+    changes S and R, so it must not reuse the old file.
+    """
+    jax = _dist_version('jax')
+    if jax and (jaxlib := _dist_version('jaxlib')):
+        jax = f'{jax}+{jaxlib}'
+    af3 = _dist_version('alphafold3')
+    if faster := _dist_version('af3-faster', 'af3_faster'):
+        af3 = f'{af3}+faster{faster}'
+    return jax, af3
+
+
+def bench_variant(cfg: Config) -> str:
+    """Active hoists and explicitly disabled fast-mode levers, for cache keys."""
+    parts = list(cfg.hoists)
+    if cfg.mode == 'fast':
+        if cfg.sampler_bf16 is False:
+            parts.append('no-sampler-bf16')
+        if cfg.hoist_logits is False:
+            parts.append('no-hoist-logits')
+    return '+'.join(parts) if parts else 'none'
+
+
 def gpu_key(
     gpu: Gpu, jax_version: str = '', af3_version: str = '',
     mode: str = 'off', model: str = 'alphafold3', hoists: str = 'none',
@@ -139,21 +179,31 @@ def gpu_key(
     )
 
 
-def cache_path(cfg: Config, gpu: Gpu, jax_version: str = '', af3_version: str = '') -> Path:
-    hoists = '+'.join(cfg.hoists) if cfg.hoists else 'none'
-    return cfg.cache_dir / (
-        f'{host_id()}__{gpu_key(gpu, jax_version, af3_version, cfg.mode, cfg.model, hoists)}.json'
-    )
+def cache_path(
+    cfg: Config, gpu: Gpu, jax_version: str | None = None,
+    af3_version: str | None = None,
+) -> Path:
+    if jax_version is None or af3_version is None:
+        jax, af3 = runtime_versions()
+        jax_version = jax if jax_version is None else jax_version
+        af3_version = af3 if af3_version is None else af3_version
+    key = gpu_key(
+        gpu, jax_version, af3_version, cfg.mode, cfg.model, bench_variant(cfg))
+    return cfg.cache_dir / f'{host_id()}__{key}.json'
 
 
 def load_bench(path: Path) -> Bench | None:
-    if not path.is_file():
+    """The cached probe, or None when absent or unreadable (a miss, not a crash)."""
+    try:
+        d = json.loads(path.read_text())
+        t = tuple(float(x) for x in d['t_ms'])
+        if len(t) != 4:
+            return None
+        host, key = d.get('host', ''), d.get('gpu_key', '')
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None
-    d = json.loads(path.read_text())
-    t = tuple(d['t_ms'])
     s, r, cont = summarise_timings(t)
-    return Bench(t_ms=t, s_ms=s, r_ms=r, contaminated=cont,
-                 host=d.get('host', ''), gpu_key=d.get('gpu_key', ''))
+    return Bench(t_ms=t, s_ms=s, r_ms=r, contaminated=cont, host=host, gpu_key=key)
 
 
 def save_bench(path: Path, bench: Bench) -> None:
@@ -213,7 +263,6 @@ def to_scheduler_gpu(bench: Bench) -> tuple[int, int]:
 
 def measure(gpu: Gpu, cfg: Config) -> Bench:
     """Spawn a per-GPU probe subprocess so the parent never initialises JAX."""
-    import sys
     env = worker_environ(
         cfg, gpu.physical_id, pci_bus_id=gpu.pci_bus_id,
         device_kind=gpu.device_kind, memory_bytes=gpu.memory_bytes)
@@ -239,15 +288,19 @@ def measure(gpu: Gpu, cfg: Config) -> Bench:
         )
     t = json.loads(r.stdout.strip().splitlines()[-1])
     s, r_ms, cont = summarise_timings(t)
-    if cont:
-        warnings.warn(f'contaminated benchmark on GPU {gpu.physical_id}: t={t}')
-    hoists = '+'.join(cfg.hoists) if cfg.hoists else 'none'
+    jax, af3 = runtime_versions()
     b = Bench(
         t_ms=tuple(t), s_ms=s, r_ms=r_ms, contaminated=cont,
         host=host_id(),
-        gpu_key=gpu_key(gpu, mode=cfg.mode, model=cfg.model, hoists=hoists),
+        gpu_key=gpu_key(gpu, jax, af3, cfg.mode, cfg.model, bench_variant(cfg)),
     )
-    save_bench(cache_path(cfg, gpu), b)
+    if cont:
+        # A noisy probe would otherwise pin this GPU to the round-robin fallback
+        # until --force-benchmark. Use it for this run only.
+        warnings.warn(
+            f'contaminated benchmark on GPU {gpu.physical_id} (not cached): t={t}')
+    else:
+        save_bench(cache_path(cfg, gpu), b)
     return b
 
 

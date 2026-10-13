@@ -1,4 +1,4 @@
-"""CLI aliases, fast-mode default, and model choices."""
+"""CLI flags: aliases, mode selection, rejected flags, model choices."""
 
 from __future__ import annotations
 
@@ -29,266 +29,157 @@ def _run(monkeypatch, argv):
     return rc, seen
 
 
-def test_omitted_mode_is_fast_when_af3_faster(monkeypatch, tmp_path: Path, capsys):
+def _argv(tmp_path: Path, *extra: str, cmd: str = 'run') -> list[str]:
+    return [cmd, '--input-dir', str(tmp_path / 'in'), '--output-dir', str(tmp_path / 'out'),
+            *extra]
+
+
+def test_mode_defaults_and_fast_mode(monkeypatch, tmp_path: Path, capsys):
+    # omitted: fast when af3-faster is installed, with a notice, else default
     _patch_tree(monkeypatch, colabfold=False, faster=True)
-    inp, out = tmp_path / 'in', tmp_path / 'out'
-    rc, seen = _run(monkeypatch, [
-        'run', '--input-dir', str(inp), '--output-dir', str(out),
-    ])
-    assert rc == 0
+    rc, seen = _run(monkeypatch, _argv(tmp_path))
     cfg = seen['cfg']
-    assert cfg.mode == 'fast'
-    assert cfg.reference == 'fast'
-    assert cfg.model == 'alphafold3'
+    assert rc == 0 and (cfg.mode, cfg.reference, cfg.model) == ('fast', 'fast', 'alphafold3')
     assert cfg.buckets_explicit is False
     assert 'using --mode fast' in capsys.readouterr().err
-
-
-def test_omitted_mode_is_default_without_af3_faster(monkeypatch, tmp_path: Path):
-    _patch_tree(monkeypatch, colabfold=False, faster=False)
-    inp, out = tmp_path / 'in', tmp_path / 'out'
-    rc, seen = _run(monkeypatch, [
-        'run', '--input-dir', str(inp), '--output-dir', str(out),
-    ])
-    assert rc == 0
-    cfg = seen['cfg']
-    assert cfg.mode == 'default'
-    assert cfg.reference == 'standard'
-
-
-def test_explicit_default_mode(monkeypatch, tmp_path: Path):
-    _patch_tree(monkeypatch, colabfold=False, faster=True)
-    inp, out = tmp_path / 'in', tmp_path / 'out'
-    rc, seen = _run(monkeypatch, [
-        'run', '--input-dir', str(inp), '--output-dir', str(out),
-        '--mode', 'default',
-    ])
-    assert rc == 0
-    assert seen['cfg'].mode == 'default'
-    assert seen['cfg'].reference == 'standard'
-
-
-def test_underscore_aliases_and_absl_false(monkeypatch, tmp_path: Path):
-    _patch_tree(monkeypatch, colabfold=False)
-    inp, out = tmp_path / 'in', tmp_path / 'out'
-    rc, seen = _run(monkeypatch, [
-        'run', '--input_dir', str(inp), '--output_dir', str(out),
-        '--num_recycles=3', '--save_embeddings=false',
-        '--flash_attention_implementation=xla',
-    ])
-    assert rc == 0
-    cfg = seen['cfg']
-    assert cfg.input_dir == inp
-    assert cfg.output_dir == out
-    assert cfg.num_recycles == 3
-    assert cfg.save_embeddings is False
-    assert cfg.flash_attention == 'xla'
-
-
-def test_json_path_alias(monkeypatch, tmp_path: Path):
-    _patch_tree(monkeypatch, colabfold=False)
-    src = tmp_path / 'in.json'
-    src.write_text('{}')
-    out = tmp_path / 'out'
-    rc, seen = _run(monkeypatch, [
-        'run', '--json_path', str(src), '--output_dir', str(out),
-    ])
-    assert rc == 0
-    assert seen['cfg'].json_path == src
-
-
-def test_data_pipeline_warns_once(monkeypatch, tmp_path: Path, capsys):
-    _patch_tree(monkeypatch, colabfold=False)
-    inp, out = tmp_path / 'in', tmp_path / 'out'
-    rc, _ = _run(monkeypatch, [
-        'run', '--input-dir', str(inp), '--output-dir', str(out),
-        '--db_dir', '/data', '--run_data_pipeline=true',
-    ])
-    assert rc == 0
-    err = capsys.readouterr().err
-    assert err.count('not running genetic') == 1
-
-
-def test_data_pipeline_false_is_silent(monkeypatch, tmp_path: Path, capsys):
-    _patch_tree(monkeypatch, colabfold=False)
-    inp, out = tmp_path / 'in', tmp_path / 'out'
-    rc, _ = _run(monkeypatch, [
-        'run', '--input-dir', str(inp), '--output-dir', str(out),
-        '--run_data_pipeline=false',
-    ])
-    assert rc == 0
-    assert 'not running genetic' not in capsys.readouterr().err
-
-
-def test_run_inference_false_fails(monkeypatch, tmp_path: Path):
-    _patch_tree(monkeypatch, colabfold=False)
-    inp, out = tmp_path / 'in', tmp_path / 'out'
-    rc, seen = _run(monkeypatch, [
-        'run', '--input-dir', str(inp), '--output-dir', str(out),
-        '--run_inference=false',
-    ])
-    assert rc == 2
-    assert 'cfg' not in seen
-
-
-def test_nojit_rejected_on_colabfold(monkeypatch, tmp_path: Path):
-    _patch_tree(monkeypatch, colabfold=True)
-    inp, out = tmp_path / 'in', tmp_path / 'out'
-    rc, seen = _run(monkeypatch, [
-        'run', '--input-dir', str(inp), '--output-dir', str(out), '--nojit',
-    ])
-    assert rc == 2
-    assert 'cfg' not in seen
-
-
-def test_mode_fast_requires_package(monkeypatch, tmp_path: Path):
-    _patch_tree(monkeypatch, colabfold=False, faster=False)
-    inp, out = tmp_path / 'in', tmp_path / 'out'
-    rc, seen = _run(monkeypatch, [
-        'run', '--input-dir', str(inp), '--output-dir', str(out), '--mode', 'fast',
-    ])
-    assert rc == 2
-    assert 'cfg' not in seen
-
-
-def test_mode_fast_switches_reference_unless_set(monkeypatch, tmp_path: Path):
-    _patch_tree(monkeypatch, colabfold=False, faster=True)
-    inp, out = tmp_path / 'in', tmp_path / 'out'
-    base = ['run', '--input-dir', str(inp), '--output-dir', str(out), '--mode', 'fast']
-    rc, seen = _run(monkeypatch, base)
-    assert rc == 0
-    assert seen['cfg'].mode == 'fast'
-    assert seen['cfg'].reference == 'fast'
-    rc, seen = _run(monkeypatch, base + ['--reference', 'standard'])
-    assert rc == 0
-    assert seen['cfg'].reference == 'standard'
-    assert seen['cfg'].mode == 'fast'
-
-
-def test_explicit_buckets_warn_when_not_tile(monkeypatch, tmp_path: Path, capsys):
-    _patch_tree(monkeypatch, colabfold=False, faster=True)
-    inp, out = tmp_path / 'in', tmp_path / 'out'
-    rc, seen = _run(monkeypatch, [
-        'run', '--input-dir', str(inp), '--output-dir', str(out),
-        '--mode', 'fast', '--buckets', '100,200',
-    ])
-    assert rc == 0
-    assert seen['cfg'].buckets_explicit is True
+    # an explicit --mode always wins
+    _, seen = _run(monkeypatch, _argv(tmp_path, '--mode', 'default'))
+    assert (seen['cfg'].mode, seen['cfg'].reference) == ('default', 'standard')
+    # fast schedules on the fast table, unless --reference says otherwise
+    _, seen = _run(monkeypatch, _argv(tmp_path, '--mode', 'fast'))
+    assert (seen['cfg'].mode, seen['cfg'].reference) == ('fast', 'fast')
+    _, seen = _run(monkeypatch, _argv(tmp_path, '--mode', 'fast', '--reference', 'standard'))
+    assert (seen['cfg'].mode, seen['cfg'].reference) == ('fast', 'standard')
+    # explicit buckets that are not multiples of 64 draw a warning
+    capsys.readouterr()
+    rc, seen = _run(monkeypatch, _argv(tmp_path, '--mode', 'fast', '--buckets', '100,200'))
+    assert rc == 0 and seen['cfg'].buckets_explicit is True
     assert seen['cfg'].buckets == (100, 200)
     assert 'not multiples of 64' in capsys.readouterr().err
+    # without af3-faster: default, and --mode fast is refused
+    _patch_tree(monkeypatch, colabfold=False, faster=False)
+    _, seen = _run(monkeypatch, _argv(tmp_path))
+    assert (seen['cfg'].mode, seen['cfg'].reference) == ('default', 'standard')
+    rc, seen = _run(monkeypatch, _argv(tmp_path, '--mode', 'fast'))
+    assert rc == 2 and 'cfg' not in seen
+    # a missing package, or a missing parent of a dotted one, is absence, not an error
+    from fullFold import af3args
+    assert af3args._module_exists('no_such_pkg') is False
+    assert af3args._module_exists('no_such_pkg.sub') is False
 
 
-def test_model_help_hides_openfold_on_orig(monkeypatch, capsys):
+def test_flag_spellings_and_scheduling_flags(monkeypatch, tmp_path: Path):
     _patch_tree(monkeypatch, colabfold=False)
-    from fullFold.cli import main
-    with pytest.raises(SystemExit) as exc:
-        main(['run', '--help'])
-    assert exc.value.code == 0
-    out = capsys.readouterr().out
-    assert 'openfold3' not in out
-    assert 'openbind0' not in out
-    assert 'alphafold3' in out
+    # run_alphafold.py spellings: underscores, --flag=false, --json_path, --gpu_device
+    rc, seen = _run(monkeypatch, [
+        'run', '--input_dir', str(tmp_path / 'in'), '--output_dir', str(tmp_path / 'out'),
+        '--num_recycles=3', '--save_embeddings=false', '--flash_attention_implementation=xla',
+        '--gpu_device=2'])
+    cfg = seen['cfg']
+    assert rc == 0 and (cfg.input_dir, cfg.output_dir) == (tmp_path / 'in', tmp_path / 'out')
+    assert (cfg.num_recycles, cfg.save_embeddings, cfg.flash_attention) == (3, False, 'xla')
+    assert cfg.gpus == ('2',)
+    src = tmp_path / 'in.json'
+    src.write_text('{}')
+    _, seen = _run(monkeypatch, ['run', '--json_path', str(src), '--output_dir', str(tmp_path)])
+    assert seen['cfg'].json_path == src
+    # defaults, then the switches that turn overlap and planning choices around
+    _, seen = _run(monkeypatch, _argv(tmp_path))
+    cfg = seen['cfg']
+    assert (cfg.prefetch, cfg.background_extract, cfg.verbose) == (1, True, False)
+    assert (cfg.bucket_mode, cfg.reference) == ('free', 'standard')
+    _, seen = _run(monkeypatch, _argv(
+        tmp_path, '--no-prefetch', '--no-background-extract', '--bucket-mode', 'ladder',
+        '--reference', 'fast', '-v'))
+    cfg = seen['cfg']
+    assert (cfg.prefetch, cfg.background_extract, cfg.verbose) == (0, False, True)
+    assert (cfg.bucket_mode, cfg.reference) == ('ladder', 'fast')
+    assert _run(monkeypatch, _argv(tmp_path, '--verbose'))[1]['cfg'].verbose is True
 
 
-def test_model_help_shows_openfold_on_colabfold(monkeypatch, capsys):
-    _patch_tree(monkeypatch, colabfold=True)
-    from fullFold.cli import main
-    with pytest.raises(SystemExit) as exc:
-        main(['run', '--help'])
-    assert exc.value.code == 0
-    out = capsys.readouterr().out
-    assert 'openfold3' in out
-    assert 'openbind0' in out
-
-
-def test_openfold_is_invalid_on_orig(monkeypatch, tmp_path: Path, capsys):
+def test_data_pipeline_flags_are_accepted_with_one_warning(monkeypatch, tmp_path: Path, capsys):
     _patch_tree(monkeypatch, colabfold=False)
-    from fullFold.cli import main
-    inp, out = tmp_path / 'in', tmp_path / 'out'
-    with pytest.raises(SystemExit):
-        main([
-            'run', '--input-dir', str(inp), '--output-dir', str(out),
-            '--model', 'openfold3',
-        ])
-    err = capsys.readouterr().err
-    assert 'invalid choice' in err
-    assert 'openbind0' not in err
-
-
-def test_of3_weights_selects_openfold_on_colabfold(monkeypatch, tmp_path: Path):
+    rc, _ = _run(monkeypatch, _argv(tmp_path, '--db_dir', '/data', '--run_data_pipeline=true'))
+    assert rc == 0 and capsys.readouterr().err.count('not running genetic') == 1
+    _run(monkeypatch, _argv(tmp_path, '--run_data_pipeline=false'))
+    assert 'not running genetic' not in capsys.readouterr().err
+    # ColabFold's own --cache_dir is not our benchmark cache
     _patch_tree(monkeypatch, colabfold=True)
-    inp, out = tmp_path / 'in', tmp_path / 'out'
-    rc, seen = _run(monkeypatch, [
-        'run', '--input-dir', str(inp), '--output-dir', str(out), '--of3_weights',
-    ])
-    assert rc == 0
-    assert seen['cfg'].model == 'openfold3'
+    rc, seen = _run(monkeypatch, _argv(tmp_path, '--cache_dir', '/tokamax'))
+    assert rc == 0 and 'tokamax' not in str(seen['cfg'].cache_dir)
+    assert 'ignoring --cache_dir' in capsys.readouterr().err
 
 
-def test_of3_checkpoint_rejected_on_colabfold(monkeypatch, tmp_path: Path, capsys):
+def test_flags_that_would_change_the_model_are_rejected(monkeypatch, tmp_path: Path, capsys):
+    _patch_tree(monkeypatch, colabfold=False)
+    rc, seen = _run(monkeypatch, _argv(tmp_path, '--run_inference=false'))
+    assert rc == 2 and 'cfg' not in seen
     _patch_tree(monkeypatch, colabfold=True)
-    inp, out = tmp_path / 'in', tmp_path / 'out'
-    rc, seen = _run(monkeypatch, [
-        'run', '--input-dir', str(inp), '--output-dir', str(out),
-        '--of3_checkpoint', 'weights.pt',
-    ])
-    assert rc == 2
-    assert 'cfg' not in seen
+    rc, seen = _run(monkeypatch, _argv(tmp_path, '--nojit'))
+    assert rc == 2 and 'cfg' not in seen
+    capsys.readouterr()
+    rc, seen = _run(monkeypatch, _argv(tmp_path, '--of3_checkpoint', 'weights.pt'))
+    assert rc == 2 and 'cfg' not in seen
     assert 'convert weights offline' in capsys.readouterr().err
 
 
-def test_of3_weights_unknown_on_orig(monkeypatch, tmp_path: Path):
-    _patch_tree(monkeypatch, colabfold=False)
+def test_model_choices_follow_the_installed_alphafold3(monkeypatch, tmp_path: Path, capsys):
     from fullFold.cli import main
-    inp, out = tmp_path / 'in', tmp_path / 'out'
-    with pytest.raises(SystemExit):
-        main([
-            'run', '--input-dir', str(inp), '--output-dir', str(out),
-            '--of3_weights',
-        ])
-
-
-def test_gpu_device_fills_gpus(monkeypatch, tmp_path: Path):
     _patch_tree(monkeypatch, colabfold=False)
-    inp, out = tmp_path / 'in', tmp_path / 'out'
-    rc, seen = _run(monkeypatch, [
-        'run', '--input-dir', str(inp), '--output-dir', str(out), '--gpu_device=2',
-    ])
-    assert rc == 0
-    assert seen['cfg'].gpus == ('2',)
+    with pytest.raises(SystemExit) as exc:
+        main(['run', '--help'])
+    out = capsys.readouterr().out
+    assert exc.value.code == 0 and 'alphafold3' in out
+    assert 'openfold3' not in out and 'openbind0' not in out
+    with pytest.raises(SystemExit):
+        main(_argv(tmp_path, '--model', 'openfold3'))
+    err = capsys.readouterr().err
+    assert 'invalid choice' in err and 'openbind0' not in err
+    with pytest.raises(SystemExit):
+        main(_argv(tmp_path, '--of3_weights'))  # only a ColabFold install knows it
+    _patch_tree(monkeypatch, colabfold=True)
+    with pytest.raises(SystemExit) as exc:
+        main(['run', '--help'])
+    out = capsys.readouterr().out
+    assert exc.value.code == 0 and 'openfold3' in out and 'openbind0' in out
+    rc, seen = _run(monkeypatch, _argv(tmp_path, '--of3_weights'))
+    assert rc == 0 and seen['cfg'].model == 'openfold3'
 
 
 def test_fast_worker_env_sets_levers(monkeypatch, tmp_path: Path):
-    monkeypatch.delenv('XLA_FLAGS', raising=False)
-    monkeypatch.delenv('AF3_JAX_SAMPLER_BF16', raising=False)
-    monkeypatch.delenv('AF3_JAX_HOIST_LOGITS', raising=False)
-    monkeypatch.delenv('AF3_FLASHPAIRFORMER', raising=False)
+    for var in ('XLA_FLAGS', 'AF3_JAX_SAMPLER_BF16', 'AF3_JAX_HOIST_LOGITS',
+                'AF3_FLASHPAIRFORMER'):
+        monkeypatch.delenv(var, raising=False)
     fast = worker_environ(
-        Config(mode='fast', sampler_bf16=False, cache_dir=tmp_path),
-        '0', device_kind='A100')
+        Config(mode='fast', sampler_bf16=False, cache_dir=tmp_path), '0', device_kind='A100')
     assert fast['XLA_FLAGS'] == XLA_TRITON_GEMM_OFF
-    assert fast['AF3_JAX_SAMPLER_BF16'] == '0'
-    assert fast['AF3_JAX_HOIST_LOGITS'] == '1'
+    assert fast['AF3_JAX_SAMPLER_BF16'] == '0' and fast['AF3_JAX_HOIST_LOGITS'] == '1'
     assert fast['AF3_FLASHPAIRFORMER'] == 'both'
-    off = worker_environ(
-        Config(mode='off', cache_dir=tmp_path), '0', device_kind='A100')
-    assert 'AF3_FLASHPAIRFORMER' not in off
-    default = worker_environ(
-        Config(mode='default', cache_dir=tmp_path), '0', device_kind='A100')
-    assert 'AF3_FLASHPAIRFORMER' not in default
+    for mode in ('off', 'default'):
+        env = worker_environ(Config(mode=mode, cache_dir=tmp_path), '0', device_kind='A100')
+        assert 'AF3_FLASHPAIRFORMER' not in env, mode
+    # the user's flags are kept and the one fast mode needs is added to them
     monkeypatch.setenv('XLA_FLAGS', '--xla_dump_to=/tmp')
-    kept = worker_environ(
+    merged = worker_environ(
         Config(mode='fast', cache_dir=tmp_path), '0', device_kind='A100')
-    assert kept['XLA_FLAGS'] == '--xla_dump_to=/tmp'
+    assert merged['XLA_FLAGS'] == f'--xla_dump_to=/tmp {XLA_TRITON_GEMM_OFF}'
+    # an explicit choice for that flag is respected
+    monkeypatch.setenv('XLA_FLAGS', '--xla_gpu_enable_triton_gemm=true --xla_dump_to=/tmp')
+    chosen = worker_environ(
+        Config(mode='fast', cache_dir=tmp_path), '0', device_kind='A100')
+    assert chosen['XLA_FLAGS'] == '--xla_gpu_enable_triton_gemm=true --xla_dump_to=/tmp'
 
 
-def test_cache_dir_underscore_is_not_the_benchmark_cache(monkeypatch, tmp_path, capsys):
-    _patch_tree(monkeypatch, colabfold=True)
-    inp, out = tmp_path / 'in', tmp_path / 'out'
-    rc, seen = _run(monkeypatch, [
-        'run', '--input-dir', str(inp), '--output-dir', str(out),
-        '--cache_dir', '/tokamax',
-    ])
-    assert rc == 0
-    assert 'tokamax' not in str(seen['cfg'].cache_dir)
-    assert 'ignoring --cache_dir' in capsys.readouterr().err
+def test_no_hoist_logits_is_not_recorded_as_active(monkeypatch, tmp_path: Path):
+    """The hoist set is part of the probe-cache key, so it must match what runs."""
+    from fullFold.hoists.fingerprint import HoistStatus
+    _patch_tree(monkeypatch, colabfold=True, faster=True)
+    names = ('cond_share', 'atom_cond_hoist', 'diffusion_hoist', 'hoist_logits')
+    monkeypatch.setattr(
+        'fullFold.hoists.evaluate_hoists',
+        lambda **k: {n: HoistStatus(n, False, True, 'native') for n in names})
+    base = _argv(tmp_path, '--mode', 'default')
+    _, on = _run(monkeypatch, base)
+    _, off = _run(monkeypatch, [*base, '--no-hoist-logits'])
+    assert 'hoist_logits' in on['cfg'].hoists
+    assert 'hoist_logits' not in off['cfg'].hoists and 'cond_share' in off['cfg'].hoists

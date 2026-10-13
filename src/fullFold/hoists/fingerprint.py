@@ -3,6 +3,13 @@
 Reads ``alphafold3`` files through ``importlib.util.find_spec`` so the
 parent process never imports AlphaFold or JAX. Hashes are AST dumps with
 docstrings stripped; comment and formatting edits do not count.
+
+``ast.dump`` is not stable across Python versions (3.13 stopped printing empty
+fields), so the same source hashes differently on 3.12 and 3.14. Each function
+therefore has several digests: ``canonical`` (our own serialisation, identical on
+every Python version) and the ``ast.dump`` forms of the running interpreter. A
+function matches when any of its current digests is listed in ``fingerprints.json``;
+``tools/update_hoist_fingerprints.py`` writes all of them.
 """
 
 from __future__ import annotations
@@ -139,23 +146,56 @@ def _find(tree: ast.AST, qualname: str) -> ast.AST | None:
     return cur
 
 
-def hash_source(source: str, qualname: str) -> str | None:
+def canonical_dump(node: ast.AST | list | object) -> str:
+    """Serialise an AST the same way on every Python version.
+
+    Only node types and non-empty fields are written, so fields that newer
+    interpreters add (always empty or None for the code we hash) do not matter.
+    """
+    if isinstance(node, ast.AST):
+        if isinstance(node, ast.Constant):
+            return f'Constant({node.value!r})'
+        parts = []
+        for name in node._fields:
+            value = getattr(node, name, None)
+            if value is None or (isinstance(value, list) and not value):
+                continue
+            parts.append(f'{name}={canonical_dump(value)}')
+        return f'{type(node).__name__}({",".join(parts)})'
+    if isinstance(node, list):
+        return '[' + ','.join(canonical_dump(v) for v in node) + ']'
+    return repr(node)
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def digests_for(node: ast.AST) -> list[str]:
+    """All digests of one function/class node; ``[0]`` is the canonical one."""
+    node = _strip_docstring(node)
+    out = [_sha(canonical_dump(node))]
+    out.append(_sha(ast.dump(node, include_attributes=False)))
+    try:  # 3.13+: also the form 3.12 printed, so hashes made there still match
+        out.append(_sha(ast.dump(node, include_attributes=False, show_empty=True)))
+    except TypeError:
+        pass
+    return list(dict.fromkeys(out))
+
+
+def _digests(source: str, qualname: str) -> list[str]:
     try:
         tree = ast.parse(source)
     except SyntaxError:
-        return None
+        return []
     node = _find(tree, qualname)
-    if node is None:
-        return None
-    dumped = ast.dump(_strip_docstring(node), include_attributes=False)
-    return hashlib.sha256(dumped.encode()).hexdigest()
+    return digests_for(node) if node is not None else []
 
 
-def hash_file(path: Path, qualname: str) -> str | None:
-    try:
-        return hash_source(path.read_text(), qualname)
-    except OSError:
-        return None
+def hash_source(source: str, qualname: str) -> str | None:
+    """Canonical (Python-version-independent) digest of ``qualname``, or None."""
+    found = _digests(source, qualname)
+    return found[0] if found else None
 
 
 def _arg_names(node: ast.AST) -> list[str]:
@@ -207,21 +247,40 @@ def native_features(root: Path | None = None) -> dict[str, bool]:
     return out
 
 
-def current_hashes(root: Path | None = None) -> dict[str, str | None]:
+def current_digests(root: Path | None = None) -> dict[str, list[str]]:
+    """Every digest of every target in the installed AlphaFold 3 (empty if missing).
+
+    Each source file is parsed once, however many targets it holds.
+    """
     root = root if root is not None else alphafold3_root()
-    out: dict[str, str | None] = {}
     if root is None:
-        return {k: None for k in TARGETS}
+        return {k: [] for k in TARGETS}
+    trees: dict[str, ast.AST | None] = {}
+    out: dict[str, list[str]] = {}
     for key, (rel, qual) in TARGETS.items():
-        out[key] = hash_file(root / rel, qual)
+        if rel not in trees:
+            try:
+                trees[rel] = ast.parse((root / rel).read_text())
+            except (OSError, SyntaxError):
+                trees[rel] = None
+        tree = trees[rel]
+        node = _find(tree, qual) if tree is not None else None
+        out[key] = digests_for(node) if node is not None else []
     return out
 
 
-def _match(key: str, digest: str | None, known: dict) -> bool:
-    if not digest:
+def current_hashes(root: Path | None = None) -> dict[str, str | None]:
+    """Canonical digest per target (None when it cannot be found)."""
+    return {k: (v[0] if v else None) for k, v in current_digests(root).items()}
+
+
+def _match(key: str, digests: list[str] | str | None, known: dict) -> bool:
+    if not digests:
         return False
+    if isinstance(digests, str):
+        digests = [digests]
     allowed = (known.get('hashes') or {}).get(key) or []
-    return digest in allowed
+    return any(d in allowed for d in digests)
 
 
 def hoist_key(statuses: dict[str, HoistStatus]) -> str:
@@ -284,15 +343,15 @@ def evaluate_hoists(
     native = native_features(root) if colabfold else {
         'conditioning_only': False, 'atom_cond': False, 'cond_share': False,
     }
-    hashes = current_hashes(root)
+    digests = current_digests(root) if not colabfold else {}
 
     def fingerprint_ok(name: str) -> tuple[bool, str]:
         missing = []
         for key in HOIST_TARGETS[name]:
-            digest = hashes.get(key)
-            if digest is None:
+            found = digests.get(key)
+            if not found:
                 missing.append(f'{key} missing')
-            elif not _match(key, digest, known):
+            elif not _match(key, found, known):
                 missing.append(f'differs in {key}')
         if missing:
             return False, '; '.join(missing)
@@ -336,9 +395,10 @@ def evaluate_hoists(
     return out
 
 
-def collect_hashes(root: Path) -> dict[str, str]:
-    found = current_hashes(root)
+def collect_hashes(root: Path) -> dict[str, list[str]]:
+    """Digests to record in ``fingerprints.json``: all forms, canonical first."""
+    found = current_digests(root)
     missing = [k for k, v in found.items() if not v]
     if missing:
         raise RuntimeError(f'could not hash: {missing}')
-    return found  # type: ignore[return-value]
+    return found
