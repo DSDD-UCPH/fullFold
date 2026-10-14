@@ -87,13 +87,22 @@ def _mkdir(p) -> Path:
     return p
 
 
+def write_output(**kw):
+    """``post_processing.write_output``, dropping ``keep_license`` where AF3 does not have it (v3.0.4 has ``terms_of_use`` only)."""
+    import inspect
+    from alphafold3.model import post_processing
+    if 'keep_license' not in inspect.signature(post_processing.write_output).parameters:
+        kw.pop('keep_license', None)
+    return post_processing.write_output(**kw)
+
+
 def write_seed_outputs(*, seed, inference_results, embeddings, distogram,
                        output_dir, job_name, compress, save_terms, rank):
     from alphafold3.model import post_processing
     import numpy as np
     output_dir = _mkdir(output_dir)
     for i, result in enumerate(inference_results):
-        post_processing.write_output(
+        write_output(
             inference_result=result, output_dir=_mkdir(output_dir / f'seed-{seed}_sample-{i}'),
             name=f'{job_name}_seed-{seed}_sample-{i}',
             compress=compress, keep_license=save_terms)
@@ -120,7 +129,7 @@ def write_job_final(*, output_dir, job_name, compress, save_terms, rank,
     if best is None:
         return
     terms = output_terms(model) if save_terms else None
-    post_processing.write_output(
+    write_output(
         inference_result=best, output_dir=output_dir, terms_of_use=terms,
         name=job_name, compress=compress, keep_license=save_terms)
     with (Path(output_dir) / f'{job_name}_ranking_scores.csv').open('w') as f:
@@ -666,9 +675,27 @@ def worker_main(argv: list[str] | None = None) -> int:
                 with contextlib.redirect_stdout(lf), contextlib.redirect_stderr(lf):
                     _write_input_json(job, cfg)
 
-        with log_path.open('a') as fp:
-            run_jobs(chunks, cfg, infer_fn=infer, extract_fn=extract,
-                     log_fp=fp, setup_fn=setup)
+        if cfg.fast_featurisation:
+            from fullFold import featfast
+            done = featfast.install(
+                conf_threads=max(1, min(8, (os.cpu_count() or 2) // (max(cfg.feat_workers, 0) + 1))))
+            print(f'fullFold: fast featurisation: {", ".join(done) or "none"}', flush=True)
+        pool = None
+        if cfg.feat_workers > 0 and max(int(cfg.prefetch), 0) > 0 and chunks:
+            from fullFold.featpool import FeaturePool
+            pool = FeaturePool(
+                chunks, cfg, workers=cfg.feat_workers, log_path=log_dir / 'featpool.jsonl',
+                stock_featurise=lambda job, seed, shape: _default_feat(job, seed, shape, cfg=cfg))
+            print(f'fullFold: {cfg.feat_workers} featurisation workers, look-ahead {pool.ahead} items', flush=True)
+        try:
+            with log_path.open('a') as fp:
+                run_jobs(chunks, cfg, infer_fn=infer, extract_fn=extract,
+                         featurise_fn=pool.featurise if pool else None,
+                         log_fp=fp, setup_fn=setup)
+        finally:
+            if pool is not None:
+                print(f'fullFold: {pool.summary()}', flush=True)
+                pool.close()
     return 0
 
 

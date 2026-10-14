@@ -125,6 +125,25 @@ fullFold still does not run genetic or template search. Data-pipeline flags are 
 
 Prefetch and background-extract are on by default. Disable with `--no-prefetch` and `--no-background-extract`.
 
+### Featurisation workers and fast featurisation
+
+Featurising a seed (MSA arrays, RDKit conformers, templates) is CPU work. For stock AlphaFold 3 v3.0.4 it takes 5-6 s for a
+~450 token complex, longer than the GPU needs for the same seed on a modern card, and a single thread in the GPU worker process
+also competes with the JAX dispatch thread for the GIL. Two options remove that bottleneck:
+
+* `--feat-workers N` (default `2`): each GPU worker keeps up to `2N+2` upcoming (job, seed) items being featurised in `N`
+  spawned CPU-only processes (`fullFold/featpool.py`) while it infers; the GPU only waits when an item is not ready. Each GPU gets
+  its own set of `N` processes, so size `N` against the CPU cores and RAM per GPU. `0` featurises in the worker as before;
+  `--no-prefetch` also disables the workers. The first two items are featurised in both places and compared bitwise; a mismatch
+  switches the workers off and says so. A failing item is featurised in the worker so its error is reported by the job as usual.
+  The log line `fullFold: feature pool: ...` at the end of `_af3sched/gpuN.log` and `_af3sched/featpool.jsonl` show how long
+  the GPU waited.
+* `--no-fast-featurisation` (or `FULLFOLD_FAST_FEAT=0`) turns off two exact speed-ups for AF3 v3.0.4 (`fullFold/featfast.py`):
+  a vectorised `extract_msa_features` (integer arrays, identical to the stock pure-Python loop) and threaded, replayed-seed RDKit
+  conformer embedding (the same conformers as stock). With both, one seed takes ~1.5-2 s instead of ~6 s. Each is installed only
+  if the installed AlphaFold 3 source has the v3.0.4 fingerprint of every function it relies on; otherwise (e.g. the ColabFold fork,
+  which has these natively) it is skipped with a notice.
+
 ## Config fields
 
 All tunables live in `config.py` (`Config`). Defaults:
@@ -138,6 +157,8 @@ All tunables live in `config.py` (`Config`). Defaults:
 | `gpus`                        | `()`                      | Override GPU indices/UUIDs; empty uses `CUDA_VISIBLE_DEVICES` or all                                                                                             |
 | `dry_run`                     | `False`                   | Write manifests and stop                                                                                                                                         |
 | `prefetch`                    | `1`                       | Seed queue depth; also prepares the next job's first seed during the current job's inference. `--no-prefetch` sets `0` and disables all overlap                  |
+| `feat_workers`                | `2`                       | Featurisation processes working ahead of each GPU (`--feat-workers`); `0` featurises in the GPU worker process                                                    |
+| `fast_featurisation`          | `True`                    | Exact AF3 v3.0.4 featurisation speed-ups (`--no-fast-featurisation` turns them off)                                                                              |
 | `background_extract`          | `True`                    | Overlap one extract+write with the next same-bucket inference. Drains before compiling a new shape. `--no-background-extract` disables it                        |
 | `policy`                      | `search`                  | `search` (per-GPU exact DP + local search, then steal tails) or `roundrobin` fallback                                                                          |
 | `plan_effort`                 | `1`                       | Search budget of `--policy search`: `0` seeds + descent, `1` default, `2` thorough. Deterministic (counted in DP cells, not seconds)                              |
@@ -202,7 +223,7 @@ A preprint or publication describing **fullFold** is not yet available. In the m
 
 > Verhellen, J. & Kooistra, A. J. **fullFold: Unlocking the Full Speed of AlphaFold 3.** Version `<version>`. GitHub: `https://github.com/DSDD-UCPH/fullFold`.
 
-For reproducibility, please replace `<version>` with the fullFold release used in your analysis (for example, `v0.1.2`). If you used an unreleased version, please cite the corresponding Git commit hash in addition to the repository URL.
+For reproducibility, please replace `<version>` with the fullFold release used in your analysis (for example, `v0.1.3`). If you used an unreleased version, please cite the corresponding Git commit hash in addition to the repository URL.
 
 Once a preprint or publication becomes available, the recommended citation will be updated here.
 

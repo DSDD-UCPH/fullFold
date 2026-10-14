@@ -44,6 +44,8 @@ class Config:
     dry_run: bool = False
     verbose: bool = False
     prefetch: int = 1
+    feat_workers: int = 2  # featurisation processes working ahead of each GPU; 0 = featurise in the worker (threads)
+    fast_featurisation: bool = True  # exact AF3 v3.0.4 featurisation speed-ups (featfast); skipped if the source differs
     background_extract: bool = True
     policy: str = 'search'  # search | roundrobin
     plan_effort: int = 1  # search budget: 0 seeds+descent, 1 default, 2 thorough

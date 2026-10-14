@@ -29,6 +29,11 @@ def _add_sched(p: argparse.ArgumentParser, *, colabfold: bool) -> None:
                    const=0, default=1)
     p.add_argument('--no-background-extract', dest='background_extract',
                    action='store_false')
+    p.add_argument('--feat-workers', '--feat_workers', type=int, default=2,
+                   help='Featurisation processes working ahead of each GPU (default 2; 0 = featurise in the '
+                        'GPU worker process as before). Each GPU gets its own set. Ignored with --no-prefetch.')
+    p.add_argument('--no-fast-featurisation', dest='fast_featurisation', action='store_false',
+                   help='Do not apply the exact featurisation speed-ups for AF3 v3.0.4')
     p.add_argument('--policy', choices=POLICIES,
                    default='search')
     p.add_argument('--plan-effort', '--plan_effort', type=int, choices=(0, 1, 2),

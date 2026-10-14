@@ -21,7 +21,7 @@ pip show fullfold
 python -c "import fullFold; print(fullFold.__version__)"
 
 # pin a specific release (e.g. to reproduce a run)
-pip install fullfold==0.1.2
+pip install fullfold==0.1.3
 
 # bleeding edge (the main branch on GitHub)
 pip install --upgrade git+https://github.com/DSDD-UCPH/fullFold.git
@@ -117,7 +117,7 @@ Two uv-specific gotchas:
 Follow DeepMind's [installation guide](https://github.com/google-deepmind/alphafold3/blob/main/docs/installation.md) for Docker, the NVIDIA container toolkit and (if needed) Singularity. The only change is **one extra line at the very end of `docker/Dockerfile`**, after the `build_data` step:
 
 ```dockerfile
-ARG FULLFOLD_VERSION=0.1.2
+ARG FULLFOLD_VERSION=0.1.3
 RUN uv pip install --python /alphafold3_venv/bin/python "fullfold==${FULLFOLD_VERSION}"
 ```
 
